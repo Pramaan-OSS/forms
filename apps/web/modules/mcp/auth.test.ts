@@ -1,0 +1,901 @@
+import { SignJWT, exportJWK, generateKeyPair, jwtVerify } from "jose";
+import { NextRequest } from "next/server";
+import { type Server, createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
+import { ApiKeyPermission } from "@forms/database/prisma";
+import { TooManyRequestsError } from "@forms/types/errors";
+import { authenticateApiKeyFromHeaders } from "@/modules/api/lib/api-key-auth";
+import { applyIPRateLimit, applyRateLimit } from "@/modules/core/rate-limit/helpers";
+import {
+  authenticateMcpRequest,
+  getMcpAuthentication,
+  getMcpRequestId,
+  handleAuthenticatedMcpRequest,
+} from "./auth";
+
+const { getJwksMock, verifyBearerTokenMock, userFindUniqueMock, warnMock } = vi.hoisted(() => ({
+  getJwksMock: vi.fn(),
+  verifyBearerTokenMock: vi.fn(),
+  userFindUniqueMock: vi.fn(),
+  warnMock: vi.fn(),
+}));
+
+vi.mock("better-auth/oauth2", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("better-auth/oauth2")>()),
+  getJwks: getJwksMock,
+}));
+
+vi.mock("@better-auth/oauth-provider/resource-client", () => ({
+  oauthProviderResourceClient: vi.fn(() => ({
+    getActions: () => ({
+      verifyBearerToken: verifyBearerTokenMock,
+    }),
+  })),
+}));
+
+vi.mock("@forms/database", () => ({
+  prisma: {
+    user: {
+      findUnique: userFindUniqueMock,
+    },
+    // This file's mock replaces the global one in vitestSetup, so it needs its own no-op
+    // `oauthResource`: Better Auth 1.7 seeds resources when the oauthProvider plugin initialises,
+    // which importing ./auth triggers, and without it the adapter throws an unhandled
+    // `Model oauthResource does not exist in the database` alongside a passing suite.
+    oauthResource: {
+      findMany: () => Promise.resolve([]),
+      findFirst: () => Promise.resolve(null),
+      findUnique: () => Promise.resolve(null),
+      create: (args: { data: unknown }) => Promise.resolve(args.data),
+      createMany: () => Promise.resolve({ count: 0 }),
+      update: (args: { data: unknown }) => Promise.resolve(args.data),
+      upsert: (args: { create: unknown }) => Promise.resolve(args.create),
+    },
+  },
+}));
+
+vi.mock("@/modules/api/lib/api-key-auth", () => ({
+  authenticateApiKeyFromHeaders: vi.fn(),
+  getBearerTokenFromHeaders: vi.fn((headers: Headers) => {
+    const authorization = headers.get("authorization");
+    return authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : null;
+  }),
+}));
+
+vi.mock("@/modules/core/rate-limit/helpers", () => ({
+  applyIPRateLimit: vi.fn().mockResolvedValue({ allowed: true }),
+  applyRateLimit: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Only the env-dependent URL getters are stubbed; the scope constants come from the real module.
+// Re-declaring them here would assert the mock against itself and mask scope drift — which is how
+// the challenge list silently diverged from the protected-resource metadata (ENG-2175).
+vi.mock("@/modules/auth/lib/oauth-urls", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/modules/auth/lib/oauth-urls")>()),
+  getAuthIssuerUrl: vi.fn(() => "https://app.example.com/api/auth"),
+  getMcpOrigin: vi.fn(() => "https://app.example.com"),
+  getMcpOAuthJwksUrl: vi.fn(() => "http://forms:3000/api/auth/jwks"),
+  getMcpProtectedResourceMetadataUrl: vi.fn(
+    () => "https://app.example.com/.well-known/oauth-protected-resource/api/mcp"
+  ),
+  getMcpResourceUrl: vi.fn(() => "https://app.example.com/api/mcp"),
+  getOAuthUserInfoUrl: vi.fn(() => "https://app.example.com/api/auth/oauth2/userinfo"),
+}));
+
+vi.mock("@forms/logger", () => ({
+  logger: {
+    withContext: vi.fn(() => ({
+      warn: warnMock,
+      error: vi.fn(),
+    })),
+  },
+}));
+
+// Imported dynamically so it resolves against the partially-mocked module above rather than being
+// hoisted past it.
+const { MCP_CHALLENGE_SCOPE, getMcpOAuthJwksUrl } = await import("@/modules/auth/lib/oauth-urls");
+
+// Two comma-separated quoted auth-params, per the `#auth-param` list grammar in RFC 9110 §11.6.1 (#8718).
+// Cases that care about the challenge's *shape* assert this rather than the whole string, so they do not
+// have to be rewritten every time the advertised scope list changes; the exact value is pinned once, from
+// the real constant, in app/api/mcp/route.test.ts.
+const CHALLENGE_GRAMMAR = /^Bearer resource_metadata="[^"]+", scope="[^"]+"$/;
+
+// Every mocked payload below carries `aud`, because every real token does — the authorization server
+// always stamps the resource a token was minted for. A fixture without it would sail past the
+// audience binding that production tokens have to satisfy, and the suite would be asserting against a
+// token shape that cannot exist.
+const MCP_AUDIENCE = "https://app.example.com/api/mcp";
+// The AS's own UserInfo endpoint, which it adds to `aud` as an implicit second resource whenever
+// `openid` is in scope. Derived from the mocked issuer above.
+const USERINFO_AUDIENCE = "https://app.example.com/api/auth/oauth2/userinfo";
+
+const apiKeyAuth = {
+  type: "apiKey" as const,
+  apiKeyId: "key_1",
+  organizationId: "org_1",
+  organizationAccess: {
+    accessControl: { read: true, write: true },
+  },
+  workspacePermissions: [
+    {
+      workspaceId: "workspace_1",
+      workspaceName: "Workspace",
+      permission: ApiKeyPermission.write,
+    },
+  ],
+};
+
+function createRequest(url = "http://localhost/api/mcp", headers: Record<string, string> = {}): NextRequest {
+  return new NextRequest(url, {
+    method: "POST",
+    headers,
+  });
+}
+
+describe("authenticateMcpRequest", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    verifyBearerTokenMock.mockReset();
+    userFindUniqueMock.mockResolvedValue({ isActive: true });
+    vi.mocked(applyRateLimit).mockResolvedValue({ allowed: true });
+    vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
+  });
+
+  test("returns 401 when no API key authenticates", async () => {
+    vi.mocked(authenticateApiKeyFromHeaders).mockResolvedValue(null);
+
+    const result = await authenticateMcpRequest(createRequest());
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(401);
+      // The challenge must advertise every resource scope so clients request them at consent and can
+      // reach the write tools (advertising only read is why write was unreachable — ENG-1055 QA),
+      // plus offline_access so a client that registers from this string can still be granted a
+      // refresh token (ENG-2175). Asserted against the real constant, not a literal.
+      expect(result.response.headers.get("WWW-Authenticate")).toContain(`scope="${MCP_CHALLENGE_SCOPE}"`);
+      expect(MCP_CHALLENGE_SCOPE).toContain("offline_access");
+      // Exactly one challenge, this one. `problemUnauthorized` contributes none of its own — the plain
+      // bearer challenge is attached by the v3 wrapper only for auth modes that accept a bearer API key
+      // — so this pins that MCP's richer challenge stands alone. Were a second ever to join it, a client
+      // reading two comma-joined challenges would discover no `resource_metadata`.
+      expect(result.response.headers.get("WWW-Authenticate")).not.toContain('realm="forms"');
+      expect(await result.response.json()).toMatchObject({
+        code: "not_authenticated",
+        detail: "API key or OAuth access token required",
+      });
+    }
+  });
+
+  test("returns 429 when missing credentials exceed the unauthenticated MCP rate limit", async () => {
+    vi.mocked(applyIPRateLimit).mockRejectedValue(new TooManyRequestsError("Too many auth requests", 45));
+
+    const result = await authenticateMcpRequest(createRequest());
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(429);
+      expect(result.response.headers.get("Retry-After")).toBe("45");
+    }
+    expect(applyRateLimit).not.toHaveBeenCalled();
+  });
+
+  test("rejects API keys in query parameters", async () => {
+    const result = await authenticateMcpRequest(createRequest("http://localhost/api/mcp?apiKey=secret"));
+
+    expect(result.ok).toBe(false);
+    expect(authenticateApiKeyFromHeaders).not.toHaveBeenCalled();
+    if (!result.ok) {
+      expect(result.response.status).toBe(400);
+      const body = await result.response.json();
+      expect(body.invalid_params[0].name).toBe("query");
+    }
+  });
+
+  test("rejects query credential parameters case-insensitively", async () => {
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp?Authorization=Bearer%20secret")
+    );
+
+    expect(result.ok).toBe(false);
+    expect(authenticateApiKeyFromHeaders).not.toHaveBeenCalled();
+    if (!result.ok) {
+      expect(result.response.status).toBe(400);
+    }
+  });
+
+  test("rejects cross-origin browser requests", async () => {
+    const result = await authenticateMcpRequest(
+      createRequest("https://app.example.com/api/mcp", {
+        origin: "https://evil.example.com",
+        host: "app.example.com",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    expect(authenticateApiKeyFromHeaders).not.toHaveBeenCalled();
+    if (!result.ok) {
+      expect(result.response.status).toBe(403);
+    }
+  });
+
+  test("does not trust forwarded host headers for origin validation", async () => {
+    const result = await authenticateMcpRequest(
+      createRequest("https://app.example.com/api/mcp", {
+        origin: "https://evil.example.com",
+        "x-forwarded-host": "evil.example.com",
+        "x-forwarded-proto": "https",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    expect(authenticateApiKeyFromHeaders).not.toHaveBeenCalled();
+    if (!result.ok) {
+      expect(result.response.status).toBe(403);
+    }
+  });
+
+  test("allows the configured public origin", async () => {
+    vi.mocked(authenticateApiKeyFromHeaders).mockResolvedValue(apiKeyAuth);
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://internal.local/api/mcp", {
+        origin: "https://app.example.com",
+        "x-api-key": "fbk_test",
+      })
+    );
+
+    expect(result.ok).toBe(true);
+  });
+
+  test("returns auth info for a valid API key and rate limits by API key id", async () => {
+    vi.mocked(authenticateApiKeyFromHeaders).mockResolvedValue(apiKeyAuth);
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        "x-request-id": "req_1",
+        "x-api-key": "fbk_test",
+      })
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.requestId).toBe("req_1");
+      expect(result.authInfo.clientId).toBe("key_1");
+      expect(result.authInfo.token).toBe("key_1");
+      expect(getMcpAuthentication(result.authInfo)).toEqual(apiKeyAuth);
+      expect(getMcpRequestId(result.authInfo)).toBe("req_1");
+      // A write-capable key must reach every tool group's read AND write tools. Asserted exactly
+      // rather than with `arrayContaining`, which is a subset matcher: it passed whether or not
+      // `getMcpScopes` granted `responses:write`, so deleting that line left the whole suite green.
+      // The read-only case below has always been exact; this one now matches it.
+      // Sorted on both sides: the set is the contract, the order is an artefact of the `Set` insertion
+      // in `getMcpScopes`. Consumers read these through `hasMcpScopes`, so reordering the adds would
+      // break this test without breaking anything real.
+      expect([...result.authInfo.scopes].sort()).toEqual(
+        [
+          "surveys:read",
+          "workflows:read",
+          "feedbackRecords:read",
+          "responses:read",
+          "surveys:write",
+          "workflows:write",
+          "feedbackRecords:write",
+          "responses:write",
+        ].sort()
+      );
+    }
+    expect(applyRateLimit).toHaveBeenCalledWith(expect.objectContaining({ namespace: "api:v3" }), "key_1");
+  });
+
+  test("grants only read scopes to a read-only API key", async () => {
+    vi.mocked(authenticateApiKeyFromHeaders).mockResolvedValue({
+      ...apiKeyAuth,
+      workspacePermissions: [
+        { workspaceId: "workspace_1", workspaceName: "Workspace", permission: ApiKeyPermission.read },
+      ],
+    });
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", { "x-api-key": "fbk_test" })
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // `responses:read` rides along (ENG-2862): the same key can already read responses through v1/v2
+      // management, so withholding it would make MCP narrower than the REST surface this credential has.
+      expect([...result.authInfo.scopes].sort()).toEqual(
+        ["surveys:read", "workflows:read", "feedbackRecords:read", "responses:read"].sort()
+      );
+    }
+  });
+
+  test("returns 429 when rate limited", async () => {
+    vi.mocked(authenticateApiKeyFromHeaders).mockResolvedValue(apiKeyAuth);
+    vi.mocked(applyRateLimit).mockRejectedValue(new TooManyRequestsError("Too many requests", 30));
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        "x-api-key": "fbk_test",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(429);
+      expect(result.response.headers.get("Retry-After")).toBe("30");
+    }
+  });
+
+  test("authenticates OAuth bearer tokens and rate limits by user and client", async () => {
+    verifyBearerTokenMock.mockResolvedValue({
+      aud: MCP_AUDIENCE,
+      sub: "user_1",
+      email: "user@example.com",
+      name: "Test User",
+      exp: 2_000_000_000,
+      azp: "client_1",
+      scope: "openid profile email surveys:read surveys:write",
+    });
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        authorization: "Bearer oauth_access_token",
+        "x-request-id": "req_oauth",
+      })
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.authInfo.clientId).toBe("client_1");
+      expect(result.authInfo.scopes).toEqual(["openid", "profile", "email", "surveys:read", "surveys:write"]);
+      expect(result.authInfo.extra.authMethod).toBe("oauth");
+      expect(getMcpAuthentication(result.authInfo)).toMatchObject({
+        user: {
+          id: "user_1",
+          email: "user@example.com",
+          name: "Test User",
+        },
+      });
+    }
+    expect(authenticateApiKeyFromHeaders).not.toHaveBeenCalled();
+    // Exact equality on purpose: this is the canary for the verify options drifting. `typ` pins the
+    // RFC 9068 access-token type, enforceable from Better Auth 1.7 (1.6 emitted no typ header).
+    expect(verifyBearerTokenMock).toHaveBeenCalledWith("oauth_access_token", {
+      verifyOptions: {
+        audience: "https://app.example.com/api/mcp",
+        issuer: "https://app.example.com/api/auth",
+        typ: "at+jwt",
+      },
+      jwksUrl: "http://forms:3000/api/auth/jwks",
+    });
+    expect(userFindUniqueMock).toHaveBeenCalledWith({
+      where: { id: "user_1" },
+      select: { isActive: true },
+    });
+    expect(applyRateLimit).toHaveBeenCalledWith(
+      expect.objectContaining({ namespace: "api:v3" }),
+      "oauth:user_1:client_1"
+    );
+  });
+
+  test("rejects OAuth bearer tokens for inactive users", async () => {
+    verifyBearerTokenMock.mockResolvedValue({
+      aud: MCP_AUDIENCE,
+      sub: "user_1",
+      azp: "client_1",
+      scope: "surveys:read surveys:write",
+    });
+    userFindUniqueMock.mockResolvedValue({ isActive: false });
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        authorization: "Bearer oauth_access_token",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(401);
+      // Auth-params are comma-separated (RFC 9110 `#auth-param`), so a strict client parser can read
+      // `resource_metadata` out of the challenge instead of choking on the whole tail. What this case is
+      // really about is the metadata URL being built from the configured origin, so assert that plus the
+      // grammar — not the scope list, which is pinned from the real constant elsewhere.
+      const challenge = result.response.headers.get("WWW-Authenticate");
+      expect(challenge).toMatch(CHALLENGE_GRAMMAR);
+      expect(challenge).toContain(
+        'resource_metadata="https://app.example.com/.well-known/oauth-protected-resource/api/mcp"'
+      );
+      expect(await result.response.json()).toMatchObject({
+        detail: "Invalid OAuth access token",
+      });
+    }
+    expect(userFindUniqueMock).toHaveBeenCalledWith({
+      where: { id: "user_1" },
+      select: { isActive: true },
+    });
+    expect(applyIPRateLimit).toHaveBeenCalledWith(expect.objectContaining({ namespace: "api:mcp:auth" }));
+    expect(applyRateLimit).not.toHaveBeenCalled();
+  });
+
+  test("rejects OAuth bearer tokens holding no MCP resource scope at all", async () => {
+    verifyBearerTokenMock.mockResolvedValue({
+      aud: MCP_AUDIENCE,
+      sub: "user_1",
+      client_id: "client_2",
+      scope: "openid profile email",
+    });
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        authorization: "Bearer oauth_access_token",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(403);
+      expect(result.response.headers.get("WWW-Authenticate")).toContain('error="insufficient_scope"');
+      // Deliberately the RESOURCE scopes, not the challenge scope: RFC 6750 `scope` names what the
+      // resource requires, and offline_access is not one of those. If this ever needs offline_access
+      // added, the baseline auth gate has been widened and MCP is accepting a token that grants no
+      // resource access.
+      expect(result.response.headers.get("WWW-Authenticate")).toContain(
+        'scope="surveys:read surveys:write workflows:read workflows:write feedbackRecords:read feedbackRecords:write responses:read responses:write"'
+      );
+    }
+    expect(applyRateLimit).not.toHaveBeenCalled();
+  });
+
+  // The inverse of the challenge fix: offline_access is advertised so clients can obtain a refresh
+  // token, but it grants no resource access, so it must never satisfy the baseline gate on its own.
+  test("rejects an OAuth bearer token scoped only to offline_access", async () => {
+    verifyBearerTokenMock.mockResolvedValue({
+      aud: MCP_AUDIENCE,
+      sub: "user_1",
+      client_id: "client_2",
+      scope: "openid profile email offline_access",
+    });
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        authorization: "Bearer oauth_access_token",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(403);
+      expect(result.response.headers.get("WWW-Authenticate")).toContain('error="insufficient_scope"');
+    }
+  });
+
+  // Any single resource scope is enough to authenticate: a feedbackRecords-only grant is a legitimate
+  // MCP client and must not be turned away for lacking surveys:read (per-tool guards still apply).
+  // `responses:read` joined that list with ENG-3470; before it, a responses-only token was refused here.
+  test.each([["feedbackRecords:read"], ["surveys:write"], ["responses:read"]])(
+    "authenticates an OAuth token scoped only to %s",
+    async (scope) => {
+      verifyBearerTokenMock.mockResolvedValue({ aud: MCP_AUDIENCE, sub: "user_1", azp: "client_1", scope });
+
+      const result = await authenticateMcpRequest(
+        createRequest("http://localhost/api/mcp", {
+          authorization: "Bearer oauth_access_token",
+        })
+      );
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.authInfo.scopes).toEqual([scope]);
+      }
+    }
+  );
+
+  // Verification is stubbed here, so these two exercise the resource server's audience check on its
+  // own — with no jose `aud` enforcement upstream of it. That is not a contrived setup: the 1.7
+  // provider drops `verifyOptions.audience` from its own verification, at which point this check is
+  // the only thing standing between a foreign-audience token and the MCP tools.
+  test("rejects an OAuth token whose audience omits the MCP resource, independently of jose", async () => {
+    verifyBearerTokenMock.mockResolvedValue({
+      aud: "https://other.example.com/api",
+      sub: "user_1",
+      azp: "client_1",
+      scope: "surveys:read",
+    });
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        authorization: "Bearer oauth_access_token",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(401);
+      expect(await result.response.json()).toMatchObject({ detail: "Invalid OAuth access token" });
+    }
+    expect(applyRateLimit).not.toHaveBeenCalled();
+  });
+
+  test("returns 429 when audience-rejected tokens exceed the unauthenticated MCP rate limit", async () => {
+    verifyBearerTokenMock.mockResolvedValue({
+      aud: [MCP_AUDIENCE, "https://other.example.com/api"],
+      sub: "user_1",
+      azp: "client_1",
+      scope: "surveys:read",
+    });
+    vi.mocked(applyIPRateLimit).mockRejectedValue(new TooManyRequestsError("Too many auth requests", 45));
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        authorization: "Bearer oauth_access_token",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(429);
+      expect(result.response.headers.get("Retry-After")).toBe("45");
+    }
+  });
+
+  test("rejects OAuth bearer tokens without a user subject", async () => {
+    verifyBearerTokenMock.mockResolvedValue({
+      aud: MCP_AUDIENCE,
+      azp: "client_1",
+      scope: "surveys:read",
+    });
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        authorization: "Bearer oauth_access_token",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(401);
+      expect(await result.response.json()).toMatchObject({
+        detail: "User OAuth access token required",
+      });
+    }
+    expect(applyIPRateLimit).toHaveBeenCalledWith(expect.objectContaining({ namespace: "api:mcp:auth" }));
+  });
+
+  test("rejects invalid OAuth bearer tokens with an OAuth challenge", async () => {
+    const invalidTokenError = Object.assign(new Error("Invalid token"), {
+      code: "ERR_JWS_SIGNATURE_VERIFICATION_FAILED",
+    });
+    verifyBearerTokenMock.mockRejectedValue(invalidTokenError);
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        authorization: "Bearer oauth_access_token",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(401);
+      // Auth-params are comma-separated (RFC 9110 `#auth-param`), so a strict client parser can read
+      // `resource_metadata` out of the challenge instead of choking on the whole tail. What this case is
+      // really about is the metadata URL being built from the configured origin, so assert that plus the
+      // grammar — not the scope list, which is pinned from the real constant elsewhere.
+      const challenge = result.response.headers.get("WWW-Authenticate");
+      expect(challenge).toMatch(CHALLENGE_GRAMMAR);
+      expect(challenge).toContain(
+        'resource_metadata="https://app.example.com/.well-known/oauth-protected-resource/api/mcp"'
+      );
+      expect(await result.response.json()).toMatchObject({
+        detail: "Invalid OAuth access token",
+      });
+    }
+    expect(applyIPRateLimit).toHaveBeenCalledWith(expect.objectContaining({ namespace: "api:mcp:auth" }));
+    expect(warnMock).toHaveBeenCalledWith(
+      {
+        errorCode: "ERR_JWS_SIGNATURE_VERIFICATION_FAILED",
+        errorName: "Error",
+        failureSource: "token_verification",
+        statusCode: 401,
+      },
+      "MCP OAuth authentication failed"
+    );
+  });
+
+  test("returns 429 when OAuth requests are rate limited", async () => {
+    verifyBearerTokenMock.mockResolvedValue({
+      aud: MCP_AUDIENCE,
+      sub: "user_1",
+      azp: "client_1",
+      scope: "surveys:read",
+    });
+    vi.mocked(applyRateLimit).mockRejectedValue(new TooManyRequestsError("Too many requests", 30));
+
+    const result = await authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        authorization: "Bearer oauth_access_token",
+      })
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(429);
+      expect(result.response.headers.get("Retry-After")).toBe("30");
+    }
+    expect(applyRateLimit).toHaveBeenCalledWith(
+      expect.objectContaining({ namespace: "api:v3" }),
+      "oauth:user_1:client_1"
+    );
+  });
+});
+
+describe("handleAuthenticatedMcpRequest", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(applyRateLimit).mockResolvedValue({ allowed: true });
+    vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
+  });
+
+  test("attaches MCP auth info and request headers to handler response", async () => {
+    vi.mocked(authenticateApiKeyFromHeaders).mockResolvedValue(apiKeyAuth);
+    const handler = vi.fn(async (request: Request & { auth?: unknown }) => {
+      expect(request.auth).toMatchObject({
+        clientId: "key_1",
+      });
+      return Response.json({ ok: true });
+    });
+
+    const response = await handleAuthenticatedMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        "x-request-id": "req_2",
+        "x-api-key": "fbk_test",
+      }),
+      handler
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Request-Id")).toBe("req_2");
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(await response.json()).toEqual({ ok: true });
+  });
+});
+
+// GHSA-p2fr-6hmx-4528. Everywhere else in this file `verifyBearerToken` is stubbed with a payload,
+// which cannot show whether a token is really accepted — the audience rule lives in jose's semantics,
+// not in a fixture. Here the stub does what the real resource client does (hand the token to jose with
+// the production `verifyOptions`), and the tokens are genuinely signed, so these cases exercise the
+// actual verification path.
+describe("MCP OAuth access token audience binding", () => {
+  const ISSUER = "https://app.example.com/api/auth";
+  let keyPair: Awaited<ReturnType<typeof generateKeyPair>>;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    userFindUniqueMock.mockResolvedValue({ isActive: true });
+    vi.mocked(applyRateLimit).mockResolvedValue({ allowed: true });
+    vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
+
+    keyPair = await generateKeyPair("ES256");
+    // A served key set: these cases are about the token, not about loading the keys.
+    getJwksMock.mockResolvedValue({ keys: [] });
+    verifyBearerTokenMock.mockImplementation(
+      async (token: string, opts: { verifyOptions: { audience: string; issuer: string } }) =>
+        (await jwtVerify(token, keyPair.publicKey, opts.verifyOptions)).payload
+    );
+  });
+
+  async function signAccessToken(aud: string | string[] | undefined): Promise<string> {
+    const token = new SignJWT({ scope: "surveys:read", azp: "client_1" })
+      // `typ: at+jwt` is what Better Auth 1.7 stamps on an access token (RFC 9068 §2.1), and the
+      // resource server now requires it — so the fixtures have to carry it to stay realistic.
+      .setProtectedHeader({ alg: "ES256", typ: "at+jwt" })
+      .setIssuer(ISSUER)
+      .setSubject("user_1")
+      .setIssuedAt()
+      .setExpirationTime("15m");
+
+    if (aud !== undefined) {
+      token.setAudience(aud);
+    }
+
+    return token.sign(keyPair.privateKey);
+  }
+
+  async function authenticateWithAudience(aud: string | string[] | undefined) {
+    return authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", {
+        authorization: `Bearer ${await signAccessToken(aud)}`,
+      })
+    );
+  }
+
+  test("accepts a token minted for the MCP resource", async () => {
+    const result = await authenticateWithAudience(MCP_AUDIENCE);
+
+    expect(result.ok).toBe(true);
+  });
+
+  test("accepts a single-element audience array", async () => {
+    const result = await authenticateWithAudience([MCP_AUDIENCE]);
+
+    expect(result.ok).toBe(true);
+  });
+
+  // Not a hypothetical, and not a future shape either: the provider already appends its own UserInfo
+  // endpoint to `aud` whenever `openid` is in the granted scopes (`checkResource` does it today, and
+  // the 1.7 resource model keeps the behaviour). `openid` leads MCP_OAUTH_SCOPES and every
+  // DCR-registered client gets it, so a rule of "exactly one audience" would reject ordinary tokens
+  // right now — which is why the check is an allow-list.
+  test("accepts the MCP resource alongside the authorization server's UserInfo endpoint", async () => {
+    const result = await authenticateWithAudience([MCP_AUDIENCE, USERINFO_AUDIENCE]);
+
+    expect(result.ok).toBe(true);
+  });
+
+  test("rejects a token that also names a foreign resource server", async () => {
+    const foreignAudience = [MCP_AUDIENCE, "https://other.example.com/api"];
+
+    // The vulnerability, made explicit: handed the exact options production passes, jose accepts this
+    // token, because its `aud` check asks whether our identifier is *present*, not whether it is the
+    // only one. Nothing in the library layer stands between this token and the MCP tools.
+    await expect(
+      jwtVerify(await signAccessToken(foreignAudience), keyPair.publicKey, {
+        audience: MCP_AUDIENCE,
+        issuer: ISSUER,
+      })
+    ).resolves.toBeDefined();
+
+    const result = await authenticateWithAudience(foreignAudience);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(401);
+      // Same opaque refusal as any other bad token — the caller learns nothing about why.
+      expect(await result.response.json()).toMatchObject({ detail: "Invalid OAuth access token" });
+    }
+    expect(applyIPRateLimit).toHaveBeenCalledWith(expect.objectContaining({ namespace: "api:mcp:auth" }));
+    expect(applyRateLimit).not.toHaveBeenCalled();
+  });
+
+  test("rejects a token minted for a different resource server", async () => {
+    const result = await authenticateWithAudience("https://other.example.com/api");
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(401);
+    }
+  });
+
+  test("rejects a token carrying no audience at all", async () => {
+    const result = await authenticateWithAudience(undefined);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(401);
+    }
+  });
+});
+
+// Better Auth reshapes a failed JWKS load inside `verifyBearerToken` — a 403 becomes a bare
+// `Error("Jwks failed: Forbidden")`, an unreachable endpoint's `TypeError` is swallowed into a
+// `no token payload` 401 — so a hand-built rejection cannot show what production logs. Here the real
+// `getJwks` and `verifyBearerToken` run against a live local endpoint.
+describe("MCP OAuth JWKS loading against the real Better Auth verifier", () => {
+  const ISSUER = "https://app.example.com/api/auth";
+  const KID = "key_1";
+  let server: Server;
+  let origin: string;
+  let unreachableUrl: string;
+  let jwksRequests: number;
+  let token: string;
+  let realOAuth2: typeof import("better-auth/oauth2");
+
+  beforeAll(async () => {
+    realOAuth2 = await vi.importActual<typeof import("better-auth/oauth2")>("better-auth/oauth2");
+
+    const keyPair = await generateKeyPair("ES256");
+    const publicJwk = { ...(await exportJWK(keyPair.publicKey)), kid: KID, alg: "ES256", use: "sig" };
+    token = await new SignJWT({ scope: "surveys:read", azp: "client_1" })
+      .setProtectedHeader({ alg: "ES256", typ: "at+jwt", kid: KID })
+      .setIssuer(ISSUER)
+      .setAudience(MCP_AUDIENCE)
+      .setSubject("user_1")
+      .setIssuedAt()
+      .setExpirationTime("15m")
+      .sign(keyPair.privateKey);
+
+    server = createServer((request, response) => {
+      if (request.url === "/jwks") {
+        jwksRequests++;
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({ keys: [publicJwk] }));
+      } else if (request.url === "/login-page") {
+        // A proxy that answers 200 with its own sign-in page instead of the key set.
+        response.setHeader("content-type", "text/html");
+        response.end("<html>Sign in</html>");
+      } else {
+        // A reverse proxy's IP allowlist refusing this server.
+        response.statusCode = 403;
+        response.end();
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+    const closed = createServer();
+    await new Promise<void>((resolve) => closed.listen(0, "127.0.0.1", resolve));
+    unreachableUrl = `http://127.0.0.1:${(closed.address() as AddressInfo).port}/jwks`;
+    await new Promise<void>((resolve) => closed.close(() => resolve()));
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  beforeEach(() => {
+    jwksRequests = 0;
+    // Set per test: the global setup resets every mock before each one.
+    getJwksMock.mockImplementation(realOAuth2.getJwks);
+    verifyBearerTokenMock.mockImplementation(realOAuth2.verifyBearerToken);
+    userFindUniqueMock.mockResolvedValue({ isActive: true });
+    vi.mocked(applyRateLimit).mockResolvedValue({ allowed: true });
+    vi.mocked(applyIPRateLimit).mockResolvedValue({ allowed: true });
+  });
+
+  async function authenticateAgainst(jwksUrl: string, bearerToken = token) {
+    vi.mocked(getMcpOAuthJwksUrl).mockReturnValue(jwksUrl);
+    return authenticateMcpRequest(
+      createRequest("http://localhost/api/mcp", { authorization: `Bearer ${bearerToken}` })
+    );
+  }
+
+  test("accepts a valid token and fetches the key set once", async () => {
+    const result = await authenticateAgainst(`${origin}/jwks`);
+
+    expect(result.ok).toBe(true);
+    // verifyBearerToken read the set the pre-load cached instead of fetching it a second time.
+    expect(jwksRequests).toBe(1);
+  });
+
+  test.each([
+    { failure: "a 403 from the JWKS endpoint", path: "/forbidden", errorName: "Error", errorCode: undefined },
+    {
+      failure: "an unreachable JWKS endpoint",
+      path: null,
+      errorName: "TypeError",
+      errorCode: "ECONNREFUSED",
+    },
+    {
+      failure: "a 200 that is not a key set",
+      path: "/login-page",
+      errorName: "JWKSInvalid",
+      errorCode: "ERR_JWKS_INVALID",
+    },
+  ])("logs $failure as a JWKS failure", async ({ path, errorName, errorCode }) => {
+    const result = await authenticateAgainst(path === null ? unreachableUrl : `${origin}${path}`);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.response.status).toBe(401);
+    }
+    // Exactly this context and nothing else: the raw error, whose message can name internal hosts,
+    // never reaches the log.
+    expect(warnMock).toHaveBeenCalledTimes(1);
+    expect(warnMock).toHaveBeenCalledWith(
+      { errorCode, errorName, failureSource: "jwks_fetch", statusCode: 401 },
+      "MCP OAuth authentication failed"
+    );
+  });
+
+  test("still logs a token that is not a JWS as a token failure while the JWKS is unreachable", async () => {
+    const result = await authenticateAgainst(unreachableUrl, "opaque_access_token");
+
+    expect(result.ok).toBe(false);
+    expect(warnMock).toHaveBeenCalledWith(
+      { errorCode: undefined, errorName: "APIError", failureSource: "token_verification", statusCode: 401 },
+      "MCP OAuth authentication failed"
+    );
+  });
+});

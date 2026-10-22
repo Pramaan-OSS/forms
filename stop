@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+project="forms-$(printf '%s' "$PWD" | cksum | cut -d ' ' -f 1)"
+docker compose -p "$project" -f compose.yml down

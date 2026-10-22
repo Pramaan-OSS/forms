@@ -1,0 +1,56 @@
+"use server";
+
+import { z } from "zod";
+import { ZId } from "@forms/types/common";
+import { AuthenticationError } from "@forms/types/errors";
+import { ZUserEmail, ZUserName } from "@forms/types/user";
+import { INVITE_DISABLED } from "@/lib/constants";
+import { authenticatedActionClient } from "@/lib/utils/action-client";
+import { sendInviteMemberEmail } from "@/modules/email";
+import {
+  reserveInviteRateLimit,
+  settleInviteRateLimit,
+} from "@/modules/organization/settings/teams/lib/invite-rate-limit";
+import { checkSetupInviteAuthorization } from "@/modules/setup/organization/[organizationId]/invite/lib/authorization";
+import { inviteUser } from "@/modules/setup/organization/[organizationId]/invite/lib/invite";
+
+const ZInviteOrganizationMemberAction = z.object({
+  email: ZUserEmail,
+  organizationId: ZId,
+  name: ZUserName,
+});
+
+export const inviteOrganizationMemberAction = authenticatedActionClient
+  .inputSchema(ZInviteOrganizationMemberAction)
+  .action(async ({ ctx, parsedInput }) => {
+    if (INVITE_DISABLED) {
+      throw new AuthenticationError("Invite disabled");
+    }
+
+    // Owner-only — see `SETUP_INVITE_ACTION` for why this path is narrower than the org settings
+    // invite path.
+    await checkSetupInviteAuthorization(ctx.user.id, parsedInput.organizationId);
+
+    // Shares one recipient-counted budget with settings, bulk, and resend invite paths.
+    const rateLimitReservation = await reserveInviteRateLimit(parsedInput.organizationId, ctx.user.id);
+
+    let invitedUserId: Awaited<ReturnType<typeof inviteUser>>;
+    try {
+      invitedUserId = await inviteUser({
+        organizationId: parsedInput.organizationId,
+        invitee: {
+          email: parsedInput.email,
+          name: parsedInput.name,
+        },
+        currentUserId: ctx.user.id,
+      });
+    } catch (error) {
+      await settleInviteRateLimit(rateLimitReservation, 0);
+      throw error;
+    }
+    await settleInviteRateLimit(rateLimitReservation, 1);
+
+    await sendInviteMemberEmail(invitedUserId, parsedInput.email, ctx.user.name, "");
+
+    return invitedUserId;
+  });

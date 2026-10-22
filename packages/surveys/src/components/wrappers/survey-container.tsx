@@ -1,0 +1,457 @@
+import { type ComponentChildren } from "preact";
+import { type MutableRef, useContext, useEffect, useRef, useState } from "preact/hooks";
+import { useTranslation } from "react-i18next";
+import { type TOverlay, type TPlacement } from "@forms/types/common";
+import { type TSurveyCardRect } from "@forms/types/forms-surveys";
+import { type TOverlayAppearance, getOverlayBackground } from "@forms/types/overlay";
+import { getResolvedAppearance, subscribeToAppearance } from "@/lib/appearance";
+import { CustomCssOwnerContext, getCustomCssGeneration, releaseCustomCss } from "@/lib/custom-css";
+import { isPlainEscape } from "@/lib/keyboard";
+import { ensureLiveRegion } from "@/lib/live-region";
+import { SURVEY_INSTRUCTIONS_ID } from "@/lib/survey-page";
+import { useFocusTrap } from "@/lib/use-focus-trap";
+import { cn, mirrorPlacementForDir } from "@/lib/utils";
+
+// Give a fallback-created live region (older SDK, see live-region.ts) a beat to be registered by
+// assistive tech before the message lands. Harmless when the region already exists.
+const ANNOUNCE_DELAY_MS = 100;
+
+type UseNoOverlayModalOptions = {
+  /** True only for a modal survey that is open and has NO overlay — the case both effects exist for. */
+  enabled: boolean;
+  containerRef: MutableRef<HTMLDivElement | null>;
+  onClose?: () => void;
+  /** Localized text announced when the survey appears. */
+  announcement: string;
+};
+
+/**
+ * The two things a modal survey rendered WITHOUT an overlay has to do for itself, because the focus
+ * trap that normally handles them is deliberately off in that case (trapping focus on a survey that
+ * does not block the page would steal the caret from the host page).
+ *
+ * 1. Handle Escape. The listener sits on the container node rather than on `document`, so Escape
+ *    closes the survey only while focus is inside it and never cancels the host page's own Escape
+ *    handling. It stays imperative because a keydown JSX prop on a non-interactive role="dialog"
+ *    element fails a11y linting.
+ * 2. Announce itself. With no overlay the survey never takes focus, so without this a screen-reader
+ *    user gets no signal that it appeared. The announcement is cleared on close, because setting
+ *    identical text twice is not a change and a later open would otherwise stay silent.
+ *
+ * Extracted from SurveyContainer, which SonarQube flagged for cognitive complexity (S3776): these
+ * two effects and their nested handlers carried most of its branching, and neither has anything to
+ * do with rendering the container. S3776 is measured per function, so pulling them out of the
+ * component is what reduces its score — the file they sit in does not matter to the rule.
+ *
+ * It lives here rather than in lib/ deliberately. It has exactly one call site and is specific to
+ * this component's modal semantics, so it is not shared code; and its whole behaviour is DOM
+ * listeners and a timer, which per AGENTS.md is covered by Playwright rather than unit tests. As a
+ * lib/*.ts module it would have added 22 lines the repo does not unit-test on principle, failing the
+ * new-code coverage gate for a refactor that changes no behaviour. The one piece that IS shared —
+ * which Escape presses count as "close", modifier guard included — lives in lib/keyboard.ts as
+ * `isPlainEscape`, alongside useFocusTrap and the language switcher that also use it.
+ */
+const useNoOverlayModal = ({
+  enabled,
+  containerRef,
+  onClose,
+  announcement,
+}: UseNoOverlayModalOptions): void => {
+  useEffect(() => {
+    if (!enabled) return;
+
+    const container = containerRef.current;
+    if (!container) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!isPlainEscape(event)) return;
+
+      event.preventDefault();
+      onClose?.();
+    };
+
+    container.addEventListener("keydown", handleKeyDown);
+    return () => {
+      container.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [enabled, onClose, containerRef]);
+
+  useEffect(() => {
+    if (!enabled) return;
+
+    const liveRegion = ensureLiveRegion();
+    liveRegion.textContent = "";
+    const announceTimeout = setTimeout(() => {
+      liveRegion.textContent = announcement;
+    }, ANNOUNCE_DELAY_MS);
+
+    return () => {
+      clearTimeout(announceTimeout);
+      liveRegion.textContent = "";
+    };
+  }, [enabled, announcement]);
+};
+
+// The card animates in over 500ms (`transition-all duration-500`) and changes height with every
+// question, so a rect read once on open is wrong almost immediately. Sample per frame until it holds
+// still for this many frames (~0.65s at 60fps, comfortably past the transition), then stop — the
+// observers restart the loop on any later change, so idling costs nothing.
+const STABLE_FRAMES_BEFORE_IDLE = 40;
+
+type UseCardRectOptions = {
+  /** True only for a modal survey that is open and whose host actually wants the rect. */
+  enabled: boolean;
+  containerRef: MutableRef<HTMLDivElement | null>;
+  onChange?: (rect: TSurveyCardRect | null) => void;
+};
+
+/**
+ * Reports the card's viewport rect to a native host so it can pass touches outside the card through
+ * to the app (see `TSurveyCardRect`).
+ *
+ * It is a prop rather than something the host reads off the DOM itself, and that is the whole point.
+ * Flutter used to scrape `#fbjs [role="dialog"][aria-modal="true"]`; making `aria-modal` conditional
+ * on the overlay — a correct a11y fix — silently matched nothing in the one case the scrape existed
+ * for, and the survey card became untappable in a shipped SDK. Nothing could catch it: the selector
+ * lived in a string, and the renderer is fetched at runtime so there was no version to pin. A typed
+ * prop moves that break to compile time and lets this markup change freely.
+ *
+ * Lives in this file rather than lib/ for the same reason as `useNoOverlayModal` above: one call
+ * site, and its whole behaviour is observers and a frame loop, which per AGENTS.md is Playwright's
+ * job rather than a unit test's.
+ */
+const useCardRect = ({ enabled, containerRef, onChange }: UseCardRectOptions): void => {
+  // Held in a ref so an inline callback from the host does not re-run the effect on every render.
+  // That matters more here than elsewhere: the cleanup reports `null`, so a spurious teardown would
+  // tell the host the card had gone and make it stop accepting touches mid-survey.
+  const onChangeRef = useRef(onChange);
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
+
+  useEffect(() => {
+    if (!enabled) return;
+    const card = containerRef.current;
+    if (!card) return;
+    // Nothing to report to, so do not spin a frame loop for a web host.
+    if (!onChangeRef.current) return;
+
+    let frame: number | null = null;
+    let lastKey = "";
+    let stableFrames = 0;
+
+    const measure = () => {
+      const box = card.getBoundingClientRect();
+      // A zero-area card is not on screen — mid-animation, or already torn down. Report it as
+      // absent rather than as a degenerate rect the host would mask touches against.
+      const rect: TSurveyCardRect | null =
+        box.width > 0 && box.height > 0
+          ? { x: box.left, y: box.top, width: box.width, height: box.height }
+          : null;
+
+      // Compare on whole pixels: sub-pixel jitter during the transition is not a change worth a
+      // bridge hop to native.
+      const key = rect
+        ? `${Math.round(rect.x)},${Math.round(rect.y)},${Math.round(rect.width)},${Math.round(rect.height)}`
+        : "none";
+
+      if (key === lastKey) {
+        stableFrames += 1;
+      } else {
+        lastKey = key;
+        stableFrames = 0;
+        onChangeRef.current?.(rect);
+      }
+
+      frame = stableFrames > STABLE_FRAMES_BEFORE_IDLE ? null : requestAnimationFrame(measure);
+    };
+
+    const restart = () => {
+      if (frame !== null) return;
+      stableFrames = 0;
+      frame = requestAnimationFrame(measure);
+    };
+
+    // ResizeObserver catches the card growing or shrinking with the question; the window listeners
+    // catch it moving without resizing, which rotation and a keyboard-driven viewport change do.
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(restart);
+    observer?.observe(card);
+    window.addEventListener("resize", restart);
+    window.addEventListener("orientationchange", restart);
+    restart();
+
+    return () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+      observer?.disconnect();
+      window.removeEventListener("resize", restart);
+      window.removeEventListener("orientationchange", restart);
+      // The card is gone. Without this the host keeps masking touches to a rect that is no longer
+      // on screen, which leaves a dead region over the app after the survey closes.
+      onChangeRef.current?.(null);
+    };
+  }, [enabled, containerRef]);
+};
+
+// Class computations for the modal chrome, at module scope alongside getPlacementStyle. They read
+// nothing but their arguments, and keeping them out of the component body is what actually moves
+// SonarQube's cognitive-complexity number (S3776): it scores each function separately, so a
+// conditional inside a nested arrow — a useEffect callback, say — never counted against
+// SurveyContainer, while every ternary and && inline in its JSX did.
+const getModalLayerClass = (isModal: boolean, hasOverlay: boolean): string =>
+  cn(
+    hasOverlay ? "pointer-events-auto" : "pointer-events-none",
+    isModal && "fixed inset-0 z-999999 flex items-end"
+  );
+
+// Only a modal survey paints a backdrop (the inline path returns before this is used), and the two
+// overlay settings are mutually exclusive, so at most one class can ever apply.
+const getOverlayBackdropClass = (overlay: TOverlay): string => {
+  if (overlay === "dark") return "bg-slate-700/80";
+  if (overlay === "light") return "bg-slate-400/50";
+  return "";
+};
+
+// A custom overlay drops the preset class, because the renderer's utilities are `!important` under
+// #fbjs and would beat the inline colour. Not the CSS `opacity` property: the dialog is a child of
+// this backdrop and would fade with it. Only the paint changes; everything keyed on `overlay` stays.
+const getOverlayBackdrop = (
+  overlay: TOverlay,
+  appearance: TOverlayAppearance | null | undefined
+): { className: string; style?: { backgroundColor: string } } => {
+  const backgroundColor = getOverlayBackground({ overlay, ...appearance });
+  if (backgroundColor) return { className: "", style: { backgroundColor } };
+
+  return { className: getOverlayBackdropClass(overlay) };
+};
+
+const getPlacementStyle = (placement: TPlacement): string => {
+  switch (placement) {
+    case "bottomRight":
+      return "sm:bottom-3 sm:right-3";
+    case "topRight":
+      return "sm:top-3 sm:right-3 sm:bottom-3";
+    case "topLeft":
+      return "sm:top-3 sm:left-3 sm:bottom-3";
+    case "bottomLeft":
+      return "sm:bottom-3 sm:left-3";
+    case "center":
+      return "sm:top-1/2 sm:left-1/2 sm:transform sm:-translate-x-1/2 sm:-translate-y-1/2";
+    default:
+      return "sm:bottom-3 sm:right-3";
+  }
+};
+
+interface SurveyContainerProps {
+  mode: "modal" | "inline";
+  placement?: TPlacement;
+  overlay?: TOverlay;
+  overlayAppearance?: TOverlayAppearance | null;
+  children: ComponentChildren;
+  onClose?: () => void;
+  clickOutside?: boolean;
+  isOpen?: boolean;
+  dir?: "ltr" | "rtl" | "auto";
+  /**
+   * Survey name. Carries two a11y jobs that happen to want the same string: it is the survey's
+   * single top-level heading (WCAG 2.4.6) and the form's accessible name (WCAG 2.4.2).
+   */
+  surveyName?: string;
+  /** Whether the survey renders a persistent instructions region worth describing the form with. */
+  hasInstructions?: boolean;
+  /** Language tag of the survey's active language, or null when the survey declares no language. */
+  lang?: string | null;
+  /** Notifies a native host where the card is, so it can pass touches outside it through to the
+   *  app. Omitted by web hosts, and then nothing is measured. */
+  onCardRectChange?: (rect: TSurveyCardRect | null) => void;
+}
+
+export function SurveyContainer({
+  mode,
+  placement = "bottomRight",
+  overlay = "none",
+  overlayAppearance,
+  children,
+  onClose,
+  clickOutside,
+  isOpen = true,
+  dir = "auto",
+  surveyName,
+  hasInstructions = false,
+  lang,
+  onCardRectChange,
+}: Readonly<SurveyContainerProps>) {
+  const isModal = mode === "modal";
+  const { t } = useTranslation();
+  const hasOverlay = overlay !== "none";
+  // Rendered on the root so the first paint already has the right palette; later changes arrive
+  // through setAppearance and only touch this attribute.
+  const [appearance, setAppearance] = useState(getResolvedAppearance);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => subscribeToAppearance(setAppearance, () => rootRef.current?.isConnected ?? true), []);
+  // Custom CSS is applied by renderSurvey just before each render; this survey owns the generation of
+  // the renderSurvey call that rendered it. It comes from context, not the module counter, so the
+  // survey's own re-renders never adopt the generation of another survey rendered since, and teardown
+  // only removes CSS this survey still owns. A new renderSurvey into the same container updates it.
+  const customCssOwner = useContext(CustomCssOwnerContext);
+  const customCssGenerationRef = useRef(customCssOwner ?? getCustomCssGeneration());
+  useEffect(() => {
+    if (customCssOwner !== null) customCssGenerationRef.current = customCssOwner;
+  }, [customCssOwner]);
+  useEffect(() => () => releaseCustomCss(customCssGenerationRef.current), []);
+  // The overlay is what makes a survey modal: it covers the host page and the page stops being usable.
+  // Without one the page underneath stays visible and clickable, so the survey is a notification, not a
+  // modal. Trapping focus there steals the caret and the text selection from the host page — the trap's
+  // document-level listeners pull focus back in on every click, tab and drag. Matches the gate the
+  // click-outside effect below already uses.
+  const modalRef = useFocusTrap<HTMLDivElement>({
+    enabled: isModal && isOpen && hasOverlay,
+    onEscapeKeyDown: onClose,
+  });
+
+  useEffect(() => {
+    if (!isModal) return;
+    if (!clickOutside) return;
+    if (!hasOverlay) return;
+
+    const handleClickOutside = (e: MouseEvent) => {
+      if (
+        isOpen &&
+        modalRef.current &&
+        !(modalRef.current as HTMLElement).contains(e.target as Node) &&
+        onClose
+      ) {
+        onClose();
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [clickOutside, hasOverlay, modalRef, onClose, isModal, isOpen]);
+
+  // Escape handling and the open announcement, both of which only a modal survey WITHOUT an overlay
+  // has to do for itself — see the hook for why.
+  useNoOverlayModal({
+    enabled: isModal && isOpen && !hasOverlay,
+    containerRef: modalRef,
+    onClose,
+    announcement: t("common.survey_opened_announcement"),
+  });
+
+  // Measured for any modal survey, not just the no-overlay case: an overlaid survey still needs a
+  // rect so the host can drop its mask the moment the card goes away, and a host that switches
+  // overlay per survey would otherwise get rects for some and not others.
+  useCardRect({
+    enabled: isModal && isOpen,
+    containerRef: modalRef,
+    onChange: onCardRectChange,
+  });
+
+  if (!isOpen) return null;
+
+  // The survey's one top-level heading. Card headlines (welcome, element prompts, ending) are all
+  // h2, so without this they would be orphaned: a screen reader user pressing H would land inside
+  // the survey with nothing naming what they are answering. It lives here rather than in
+  // survey.tsx's getCardContent, which runs once per card and would emit one h1 per peeking card
+  // in the stacked layout. Visually hidden because the card designs have no room for a title — the
+  // survey name is already the document title on link surveys.
+  //
+  // It is rendered as a sibling of `children` in BOTH branches so that it always ends up inside the
+  // dialog on the modal path: `aria-modal="true"` makes assistive tech ignore everything outside
+  // the dialog element, so a heading placed on the #fbjs root would be unreachable there.
+  //
+  // A survey without a name — an app survey, whose name the public API withholds (see
+  // getSurveyDisplayName) — falls back to a generic label on both surfaces rather than dropping the
+  // heading. A generic h1 still tells a respondent pressing H that they have reached the survey;
+  // no h1 leaves the card headings orphaned on the delivery path most app respondents take (ENG-2799).
+  // The same label names the inline form landmark and the modal dialog, so the three never disagree.
+  const surveyLabel = surveyName ?? t("common.survey_dialog");
+  const surveyHeading = <h1 className="sr-only">{surveyLabel}</h1>;
+
+  // The VPAT finding is that "forms themselves have no titles": every input had a label, but the
+  // form they belong to had no accessible name at all. role="form" + a name fixes that for BOTH
+  // surfaces — an embedded survey cannot own the host document's <title>, so this is the only name it
+  // can carry. The name always exists (the survey name, or the generic fallback above), so the form
+  // landmark is always named rather than left out of the landmark list.
+  // Survey instructions used to appear on the welcome card and never again. Pointing the form at the
+  // persistent region means they are announced on entry to every page.
+  //
+  // role="form" on a div rather than a native <form>, which is what Sonar's S6819 asks for, because
+  // neither of the two things a real form element brings is safe here. An inline survey is rendered
+  // into a container the host page supplies by id (see packages/surveys/src/index.ts), which can sit
+  // anywhere in their document — including inside their own <form>. Nested forms are invalid HTML and
+  // the browser drops the inner one, which would silently take this accessible name with it. And a
+  // real form makes Enter in any text input submit and navigate away from a half-finished survey.
+  // The role gives assistive tech the same landmark without either behaviour.
+  const instructionsId = hasInstructions ? SURVEY_INSTRUCTIONS_ID : undefined;
+
+  if (!isModal) {
+    return (
+      <div // NOSONAR(typescript:S6819) - a native <form> would nest inside the host page's own form
+        id="fbjs"
+        ref={rootRef}
+        className="forms-form"
+        data-appearance={appearance}
+        // Root isolation (ENG-3552): customer z-index values stack inside the survey instead of
+        // interleaving with the host page. The modal path needs no equivalent: its fixed, z-indexed
+        // layer is already a stacking context.
+        style={{ height: "100%", width: "100%", isolation: "isolate" }}
+        dir={dir}
+        lang={lang ?? undefined}
+        role="form"
+        aria-label={surveyLabel}
+        aria-describedby={instructionsId}>
+        {surveyHeading}
+        {children}
+      </div>
+    );
+  }
+
+  const backdrop = getOverlayBackdrop(overlay, overlayAppearance);
+
+  return (
+    <div
+      id="fbjs"
+      ref={rootRef}
+      className="forms-form"
+      data-appearance={appearance}
+      // The root takes no clicks, so survey CSS that stretches it over the page cannot swallow the host
+      // page's clicks; the processor removes `pointer-events`, so it cannot turn this back on. Only the
+      // dialog, and the backdrop when the overlay setting asks for one, set their own.
+      style={{ pointerEvents: "none" }}
+      dir={dir}
+      lang={lang ?? undefined}>
+      <div
+        // In-dialog updates (question changes after a submit) should wait for the reader to finish
+        // speaking instead of interrupting it. A survey is never urgent enough for assertive speech.
+        aria-live="polite"
+        className={getModalLayerClass(isModal, hasOverlay)}>
+        <div
+          className={cn("relative h-full w-full transition-all duration-500 ease-in-out", backdrop.className)}
+          style={backdrop.style}>
+          <div
+            ref={modalRef}
+            role="dialog"
+            // Only a survey that actually blocks the page is a modal dialog. `aria-modal` makes
+            // assistive tech ignore everything outside it, so setting it on a corner survey hides the
+            // host page from screen-reader users while they can still see and use it.
+            aria-modal={hasOverlay ? "true" : undefined}
+            aria-label={surveyLabel}
+            aria-describedby={hasInstructions ? SURVEY_INSTRUCTIONS_ID : undefined}
+            tabIndex={-1}
+            className={cn(
+              getPlacementStyle(mirrorPlacementForDir(placement, dir)),
+              isOpen ? "opacity-100" : "opacity-0",
+              "rounded-custom pointer-events-auto absolute bottom-0 h-fit w-full overflow-visible bg-(--fb-dialog-background-color,white) shadow-lg transition-all duration-500 ease-in-out sm:m-4 sm:max-w-sm"
+            )}>
+            <div>
+              {surveyHeading}
+              {children}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

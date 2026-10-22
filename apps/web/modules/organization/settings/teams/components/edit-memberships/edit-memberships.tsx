@@ -1,0 +1,47 @@
+import { TOrganizationRole } from "@forms/types/memberships";
+import { TOrganization } from "@forms/types/organizations";
+import { getAccessFlags } from "@/lib/membership/utils";
+import { MembersInfo } from "@/modules/organization/settings/teams/components/edit-memberships/members-info";
+import { getInvitesByOrganizationId } from "@/modules/organization/settings/teams/lib/invite";
+import { getMembershipByOrganizationId } from "@/modules/organization/settings/teams/lib/membership";
+
+interface EditMembershipsProps {
+  organization: TOrganization;
+  currentUserId: string;
+  role: TOrganizationRole;
+  isUserManagementDisabledFromUi: boolean;
+}
+
+/**
+ * The column headers used to live here, hand-rolled as a `grid-cols-12` of divs, while the rows lived in
+ * `MembersInfo` — two files repeating the same `col-span-*` sequence and the same two feature flags. They
+ * are now one column array in `MembersInfo`, which is where the flags already were.
+ */
+export const EditMemberships = async ({
+  organization,
+  currentUserId,
+  role,
+  isUserManagementDisabledFromUi,
+}: EditMembershipsProps) => {
+  const members = await getMembershipByOrganizationId(organization.id);
+  const invites = await getInvitesByOrganizationId(organization.id);
+
+  if (!role) return null;
+
+  // Last sign-in is for Owners and Managers only (ENG-3317). Strip it here rather than hiding a column, so
+  // it never reaches anyone else's page payload.
+  const { isOwner, isManager } = getAccessFlags(role);
+  const visibleMembers =
+    isOwner || isManager ? members : members.map((member) => ({ ...member, lastLoginAt: undefined }));
+
+  return (
+    <MembersInfo
+      organization={organization}
+      currentUserId={currentUserId}
+      invites={invites ?? []}
+      members={visibleMembers}
+      currentUserRole={role}
+      isUserManagementDisabledFromUi={isUserManagementDisabledFromUi}
+    />
+  );
+};

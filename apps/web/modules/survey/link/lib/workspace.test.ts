@@ -1,0 +1,312 @@
+import "@testing-library/jest-dom/vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { prisma } from "@forms/database";
+import { Prisma } from "@forms/database/prisma";
+import { DatabaseError, ResourceNotFoundError } from "@forms/types/errors";
+import { DEFAULT_ORGANIZATION_BILLING } from "@forms/types/organizations";
+import { validateInputs } from "@/lib/utils/validate";
+import { getWorkspaceById, getWorkspaceContextForLinkSurvey } from "./workspace";
+
+vi.mock("@/lib/utils/validate", () => ({
+  validateInputs: vi.fn(),
+}));
+
+vi.mock("@forms/database", () => ({
+  prisma: {
+    workspace: {
+      findUnique: vi.fn(),
+    },
+  },
+}));
+
+vi.mock("@forms/logger", () => ({
+  logger: {
+    error: vi.fn(),
+  },
+}));
+
+// Mock React cache
+vi.mock("react", async () => {
+  const actualReact = await vi.importActual("react");
+  return {
+    ...actualReact,
+    cache: vi.fn((fn) => fn),
+  };
+});
+
+describe("getWorkspaceById", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  test("should validate inputs", async () => {
+    const workspaceId = "test-workspace-id";
+
+    await getWorkspaceById(workspaceId);
+
+    expect(validateInputs).toHaveBeenCalledWith([workspaceId, expect.any(Object)]);
+  });
+
+  test("should return workspace data when found", async () => {
+    const workspaceId = "test-workspace-id";
+    const mockWorkspace = {
+      id: workspaceId,
+      linkSurveyBranding: true,
+      logo: null,
+      styling: {},
+      name: "Test Workspace",
+    };
+
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValueOnce(mockWorkspace as any);
+
+    const result = await getWorkspaceById(workspaceId);
+
+    expect(result).toEqual(mockWorkspace);
+    expect(prisma.workspace.findUnique).toHaveBeenCalledWith({
+      where: {
+        id: workspaceId,
+      },
+      select: {
+        customHeadScripts: true,
+        linkSurveyBranding: true,
+        logo: true,
+        styling: true,
+        name: true,
+      },
+    });
+  });
+
+  test("should return null when workspace not found", async () => {
+    const workspaceId = "nonexistent-workspace-id";
+
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValueOnce(null);
+
+    const result = await getWorkspaceById(workspaceId);
+
+    expect(result).toBeNull();
+  });
+
+  test("should throw DatabaseError on Prisma known request error", async () => {
+    const workspaceId = "test-workspace-id";
+    const prismaError = new Prisma.PrismaClientKnownRequestError("Database error", {
+      code: "P2025",
+      clientVersion: "5.0.0",
+    });
+
+    vi.mocked(prisma.workspace.findUnique).mockRejectedValueOnce(prismaError);
+
+    await expect(getWorkspaceById(workspaceId)).rejects.toThrow(DatabaseError);
+  });
+
+  test("should rethrow non-Prisma errors", async () => {
+    const workspaceId = "test-workspace-id";
+    const genericError = new Error("Generic error");
+
+    vi.mocked(prisma.workspace.findUnique).mockRejectedValueOnce(genericError);
+
+    await expect(getWorkspaceById(workspaceId)).rejects.toThrow(genericError);
+  });
+});
+
+describe("getWorkspaceContextForLinkSurvey", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  test("should successfully fetch workspace context with all required data", async () => {
+    const mockWorkspaceId = "clh1a2b3c4d5e6f7g8h9j";
+    const mockData = {
+      id: mockWorkspaceId,
+      name: "Test Workspace",
+      styling: { primaryColor: "#000000" },
+      logo: { url: "https://example.com/logo.png" },
+      linkSurveyBranding: true,
+      customHeadScripts: null,
+      organizationId: "clh1a2b3c4d5e6f7g8h9k",
+      organization: {
+        id: "clh1a2b3c4d5e6f7g8h9k",
+        billing: {
+          stripeCustomerId: null,
+          limits: {
+            monthly: {
+              responses: 100,
+            },
+            workspaces: 3,
+          },
+          usageCycleAnchor: new Date("2026-01-01T00:00:00.000Z"),
+          stripe: null,
+        },
+        whitelabel: null,
+      },
+    };
+
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(mockData as any);
+
+    const result = await getWorkspaceContextForLinkSurvey(mockWorkspaceId);
+
+    expect(result).toEqual({
+      workspace: {
+        id: mockWorkspaceId,
+        name: "Test Workspace",
+        styling: { primaryColor: "#000000" },
+        logo: { url: "https://example.com/logo.png" },
+        linkSurveyBranding: true,
+        customHeadScripts: null,
+      },
+      customCss: null,
+      organizationId: "clh1a2b3c4d5e6f7g8h9k",
+      organizationBilling: DEFAULT_ORGANIZATION_BILLING,
+      organizationWhitelabel: null,
+    });
+
+    expect(prisma.workspace.findUnique).toHaveBeenCalledWith({
+      where: { id: mockWorkspaceId },
+      select: {
+        id: true,
+        name: true,
+        styling: true,
+        logo: true,
+        linkSurveyBranding: true,
+        customHeadScripts: true,
+        customCss: true,
+        organizationId: true,
+        organization: {
+          select: {
+            id: true,
+            whitelabel: true,
+          },
+        },
+      },
+    });
+  });
+
+  test("should throw ResourceNotFoundError when workspace is not found", async () => {
+    const mockWorkspaceId = "clh1a2b3c4d5e6f7g8h9m";
+
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(null);
+
+    await expect(getWorkspaceContextForLinkSurvey(mockWorkspaceId)).rejects.toThrow(ResourceNotFoundError);
+    await expect(getWorkspaceContextForLinkSurvey(mockWorkspaceId)).rejects.toThrow("Workspace");
+  });
+
+  test("should throw ResourceNotFoundError when workspace has no organization", async () => {
+    const mockWorkspaceId = "clh1a2b3c4d5e6f7g8h9n";
+    const mockData = {
+      id: mockWorkspaceId,
+      name: "Test Workspace",
+      styling: {},
+      logo: null,
+      linkSurveyBranding: true,
+      customHeadScripts: null,
+      organizationId: "clh1a2b3c4d5e6f7g8h9p",
+      organization: null,
+    };
+
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(mockData as any);
+
+    await expect(getWorkspaceContextForLinkSurvey(mockWorkspaceId)).rejects.toThrow(ResourceNotFoundError);
+    await expect(getWorkspaceContextForLinkSurvey(mockWorkspaceId)).rejects.toThrow("Organization");
+  });
+
+  test("should throw DatabaseError on Prisma error", async () => {
+    const mockWorkspaceId = "clh1a2b3c4d5e6f7g8h9q";
+    const prismaError = new Prisma.PrismaClientKnownRequestError("Database error", {
+      code: "P2025",
+      clientVersion: "5.0.0",
+    });
+
+    vi.mocked(prisma.workspace.findUnique).mockRejectedValue(prismaError);
+
+    await expect(getWorkspaceContextForLinkSurvey(mockWorkspaceId)).rejects.toThrow(DatabaseError);
+    await expect(getWorkspaceContextForLinkSurvey(mockWorkspaceId)).rejects.toThrow("Database error");
+  });
+
+  test("should rethrow non-Prisma errors", async () => {
+    const mockWorkspaceId = "clh1a2b3c4d5e6f7g8h9r";
+    const genericError = new Error("Generic error");
+
+    vi.mocked(prisma.workspace.findUnique).mockRejectedValue(genericError);
+
+    await expect(getWorkspaceContextForLinkSurvey(mockWorkspaceId)).rejects.toThrow(genericError);
+  });
+
+  test("should handle workspace with minimal data", async () => {
+    const mockWorkspaceId = "clh1a2b3c4d5e6f7g8h9s";
+    const mockData = {
+      id: mockWorkspaceId,
+      name: "Minimal Workspace",
+      styling: null,
+      logo: null,
+      linkSurveyBranding: false,
+      customHeadScripts: null,
+      organizationId: "clh1a2b3c4d5e6f7g8h9u",
+      organization: {
+        id: "clh1a2b3c4d5e6f7g8h9u",
+        billing: {
+          stripeCustomerId: null,
+          limits: {
+            monthly: {
+              responses: 100,
+            },
+            workspaces: 3,
+          },
+          usageCycleAnchor: new Date("2026-01-01T00:00:00.000Z"),
+          stripe: null,
+        },
+        whitelabel: null,
+      },
+    };
+
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(mockData as any);
+
+    const result = await getWorkspaceContextForLinkSurvey(mockWorkspaceId);
+
+    expect(result).toEqual({
+      workspace: {
+        id: mockWorkspaceId,
+        name: "Minimal Workspace",
+        styling: null,
+        logo: null,
+        linkSurveyBranding: false,
+        customHeadScripts: null,
+      },
+      customCss: null,
+      organizationId: "clh1a2b3c4d5e6f7g8h9u",
+      organizationBilling: DEFAULT_ORGANIZATION_BILLING,
+      organizationWhitelabel: null,
+    });
+  });
+  test("keeps the stored custom CSS off the workspace object that client components receive", async () => {
+    const mockWorkspaceId = "clh1a2b3c4d5e6f7g8h9v";
+    const storedCustomCss = {
+      light: {
+        source: ".a { color: red }",
+        compiled: "@layer fb-workspace { #fbjs .a { color: red !important } }",
+      },
+      dark: null,
+      processorVersion: 1,
+    };
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      id: mockWorkspaceId,
+      name: "Styled Workspace",
+      styling: null,
+      logo: null,
+      linkSurveyBranding: true,
+      customHeadScripts: null,
+      customCss: storedCustomCss,
+      organizationId: "clh1a2b3c4d5e6f7g8h9w",
+      organization: {
+        id: "clh1a2b3c4d5e6f7g8h9w",
+        billing: { stripeCustomerId: null, limits: {}, usageCycleAnchor: null, stripe: null },
+        whitelabel: null,
+      },
+    } as any);
+
+    const result = await getWorkspaceContextForLinkSurvey(mockWorkspaceId);
+
+    // `workspace` is passed whole to client components (SurveyClientWrapper, SurveyInactive, PinScreen),
+    // so the source-carrying stored value must live beside it, never inside it.
+    expect(result.customCss).toEqual(storedCustomCss);
+    expect(result.workspace).not.toHaveProperty("customCss");
+  });
+});

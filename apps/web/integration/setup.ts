@@ -1,0 +1,44 @@
+/* eslint-disable turbo/no-undeclared-env-vars -- harness-only env overrides (TEST_*), not app config */
+import { vi } from "vitest";
+
+/**
+ * Per-file setup for the Better Auth integration harness (ENG-1054).
+ *
+ * Point the app at the isolated test database + Redis BEFORE the test file imports `@/lib/env` or the
+ * `@forms/database` prisma singleton (both bind to `process.env` at import time). setupFiles run
+ * before the test module's imports, so these assignments win over the `.env` loaded by `dotenv -e`.
+ *
+ * NOTE: this harness does NOT mock `@forms/database` (the unit harness, vitestSetup.ts, does) —
+ * the whole point is to exercise the real prisma client against a real Postgres.
+ */
+process.env.DATABASE_URL =
+  process.env.TEST_DATABASE_URL ??
+  "postgresql://postgres:postgres@localhost:5432/forms_ba_test?schema=public";
+process.env.REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://localhost:6379/15";
+// Better Auth requires a secret; provide a stable test one if the loaded env doesn't carry it.
+process.env.BETTER_AUTH_SECRET ??= "integration-test-better-auth-secret-0123456789abcdef";
+// Disable rate limiting in the harness — counters would accumulate in the shared Redis db across tests.
+process.env.RATE_LIMITING_DISABLED ??= "1";
+
+// server-only is a Next.js build guard; no-op it under vitest.
+vi.mock("server-only", () => ({}));
+
+// Capture transactional emails instead of sending via SMTP. These resolve `true` because the real
+// senders return Promise<boolean> and a FALSY result means "not sent" — auth.ts treats that as a send
+// failure (ENG-2091), so a mock resolving undefined would fake an outage.
+//
+// Keep this the ONE place the module is mocked for integration tests. A per-file `vi.mock` of the same
+// module replaces this wholesale, so an incomplete copy silently drops senders or gets their return
+// type wrong — which is exactly how the undefined-vs-boolean bug above got in. Add senders here.
+vi.mock("@/modules/email", () => ({
+  sendVerificationLinkEmail: vi.fn(async () => true),
+  // The SSO-recovery pair (ENG-2783): startSsoRecovery sends the first, completeSsoRecovery the second.
+  sendVerificationEmail: vi.fn(async () => true),
+  sendSsoRecoveryFactorsRemovedEmail: vi.fn(async () => true),
+  // ENG-3262: forgot-password sends this instead of a reset link to an account with no password.
+  sendSsoSignInHintEmail: vi.fn(async () => true),
+  sendPasswordResetLinkEmail: vi.fn(async () => true),
+  sendPasswordResetNotifyEmail: vi.fn(async () => true),
+  sendDeleteAccountConfirmationEmail: vi.fn(async () => true),
+  sendInviteAcceptedEmail: vi.fn(async () => undefined), // returns void, not boolean
+}));

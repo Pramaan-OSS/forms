@@ -1,0 +1,272 @@
+/*
+  Cascade layer order (ENG-3449 / ENG-3552). The first statement in this stylesheet, so wherever the
+  host page has not named these layers yet, it fixes their order before anything below registers
+  them. Customer CSS lives in the four fb-* layers and is all `!important`, and for important
+  declarations the earlier layer wins: survey dark > survey > workspace dark > workspace > the
+  theme editor and every built-in style. Keep in sync with CUSTOM_CSS_LAYER_ORDER in
+  packages/types/custom-css.ts; the renderer also puts the fb-* names first in <head>.
+*/
+@layer fb-survey-dark, fb-survey, fb-workspace-dark, fb-workspace, theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities) important;
+
+/* NOSONAR: Tailwind CSS v4 directives - @config and @source are valid at-rules */
+@config "../../tailwind.config.cjs";
+/* NOSONAR */
+@source "../../src/**/*.{ts,tsx,js,jsx}";
+/* NOSONAR */
+
+/*
+  Unitless line heights (ENG-3427). Without these, `leading-<n>` is `calc(var(--spacing) * n)`, and
+  rem→em plus `--spacing: .25em` make that an em length. iPhone WebKit scales an em line-height twice
+  under the iOS SDK's `-webkit-text-size-adjust` (Dynamic Type): once through the enlarged font size,
+  then again as a length. A ratio scales once. n / 4 is what the em length gave on the element itself,
+  so the default size is unchanged. Keep in sync with survey-ui's globals.css.
+*/
+@theme inline {
+  --leading-4: 1;
+  --leading-5: 1.25;
+  --leading-6: 1.5;
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  #fbjs *,
+  #fbjs ::after,
+  #fbjs ::before,
+  #fbjs ::backdrop,
+  #fbjs ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+/* Chrome, Edge, and Safari */
+#fbjs *::-webkit-scrollbar {
+  width: 6px;
+  background: transparent;
+}
+
+#fbjs *::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+#fbjs *::-webkit-scrollbar-thumb {
+  background-color: var(--fb-brand-color);
+  border: none;
+  border-radius: 10px;
+}
+
+/* Firefox */
+#fbjs * {
+  scrollbar-width: thin;
+  scrollbar-color: var(--fb-brand-color) transparent;
+}
+
+/* this is for styling the HtmlBody component */
+#fbjs .htmlbody {
+  @apply block text-sm leading-6 font-normal;
+  /* need to use !important because in packages/survey-ui/components/editor/styles-editor-frontend.css the color is defined for some classes */
+  color: var(--fb-subheading-color) !important;
+}
+
+/*
+ * A rich-text headline or description is the hook element its formatted text inherits from (see
+ * survey-ui's globals.css), so it carries the headline or description values, not the body-text
+ * defaults above. Its own text is all inside that markup, so this only changes what it passes down.
+ */
+#fbjs .htmlbody.label-headline {
+  font-size: var(--fb-element-headline-font-size);
+  font-weight: var(--fb-element-headline-font-weight);
+  color: var(--fb-element-headline-color) !important;
+}
+
+#fbjs .htmlbody.label-description {
+  font-size: var(--fb-element-description-font-size);
+  font-weight: var(--fb-element-description-font-weight);
+  color: var(--fb-element-description-color) !important;
+}
+
+/*
+ * Keep bold (<strong>/<b>) inside rich text actually bold. The headline /
+ * description font-weight rules injected by styles.ts target every descendant
+ * (`.label-headline *`), which would otherwise flatten bold spans to the base
+ * weight and erase the contrast between bold and non-bold text. Higher
+ * specificity + !important wins over those runtime rules.
+ */
+#fbjs .label-headline strong,
+#fbjs .label-headline b,
+#fbjs .label-description strong,
+#fbjs .label-description b,
+#fbjs .text-subheading strong,
+#fbjs .text-subheading b,
+#fbjs .htmlbody strong,
+#fbjs .htmlbody b {
+  font-weight: 700 !important;
+}
+
+/*
+ * Restore list styling for rich text (questions/descriptions).
+ * Preflight resets ul/ol with list-style:none; these overrides restore bullets/numbers.
+ */
+#fbjs .htmlbody ul,
+#fbjs .htmlbody ol,
+#fbjs [data-variant="headline"] ul,
+#fbjs [data-variant="headline"] ol,
+#fbjs [data-variant="description"] ul,
+#fbjs [data-variant="description"] ol {
+  list-style-position: outside;
+  margin: 0.5em 0;
+  padding-inline-start: 1.5em;
+}
+#fbjs .htmlbody ul,
+#fbjs [data-variant="headline"] ul,
+#fbjs [data-variant="description"] ul {
+  list-style-type: disc;
+}
+#fbjs .htmlbody ol,
+#fbjs [data-variant="headline"] ol,
+#fbjs [data-variant="description"] ol {
+  list-style-type: decimal;
+}
+#fbjs .htmlbody li,
+#fbjs [data-variant="headline"] li,
+#fbjs [data-variant="description"] li {
+  margin: 0.25em 0;
+}
+/*
+ * The rules above are the fallback for list markup without the editor's theme classes. Rich text
+ * authored in the app carries them, and its geometry (1.5em per level, no item margins, no marker
+ * on the .fb-editor-nested-listitem wrapper Lexical puts around a nested list) comes from the
+ * editor stylesheet that lib/styles.ts injects right after this file — one definition shared with
+ * the editor itself. Source of truth for those class names:
+ * apps/web/modules/ui/components/editor/lib/example-theme.ts
+ */
+
+/* without this, it wont override the color */
+#fbjs p.editor-paragraph {
+  overflow-wrap: break-word;
+}
+
+/* theming */
+#fbjs {
+  font-size: 16px;
+  /* Pin native controls and scrollbars to the survey's own appearance; otherwise a light survey
+     inherits a host page's `color-scheme: dark`. The dark block below switches it to dark. */
+  color-scheme: light;
+  --brand-default: #1e40af;
+  --slate-50: rgb(248, 250, 252);
+  --slate-100: rgb(241 245 249);
+  --slate-200: rgb(226 232 240);
+  --slate-300: rgb(203, 213, 225);
+  --slate-400: rgb(148 163 184);
+  --slate-500: rgb(100 116 139);
+  --slate-600: rgb(71 85 105);
+  --slate-700: rgb(51 65 85);
+  --slate-800: rgb(30 41 59);
+  --slate-900: rgb(15 23 42);
+  --gray-100: rgb(243 244 246);
+  --gray-200: rgb(229 231 235);
+  --yellow-100: rgb(254 249 195);
+  --yellow-300: rgb(253 224 71);
+  --yellow-500: rgb(234 179 8);
+
+  /* Default Light Theme, you can override everything by changing these values */
+  --fb-brand-color: var(--brand-default);
+  --fb-brand-text-color: black;
+  --fb-border-color: var(--slate-300);
+  --fb-border-color-highlight: var(--slate-500);
+  --fb-focus-color: var(--slate-500);
+  --fb-heading-color: var(--slate-900);
+  --fb-subheading-color: var(--slate-700);
+  --fb-placeholder-color: var(--slate-300);
+  --fb-info-text-color: var(--slate-500);
+  /* slate-600, not slate-500: the branding line is 12px text and slate-500 on a white
+     card is 4.42:1 — just under the WCAG 1.4.3 AA 4.5:1 threshold (axe color-contrast). */
+  --fb-signature-text-color: var(--slate-600);
+  --fb-branding-text-color: var(--slate-600);
+  --fb-survey-background-color: white;
+  --fb-survey-border-color: var(--slate-50);
+  --fb-accent-background-color: var(--slate-200);
+  --fb-accent-background-color-selected: var(--slate-100);
+  --fb-input-background-color: var(--slate-50);
+  --fb-input-background-color-selected: var(--slate-200);
+  --fb-placeholder-color: var(--slate-400);
+  --fb-rating-fill: var(--yellow-100);
+  --fb-rating-hover: var(--yellow-500);
+  --fb-back-btn-border: transparent;
+  --fb-submit-btn-border: transparent;
+  --fb-rating-selected: black;
+  --fb-close-btn-color: var(--slate-500);
+  --fb-close-btn-color-hover: var(--slate-700);
+  --fb-calendar-tile-color: var(--slate-50);
+  --fb-border-radius: 8px;
+}
+
+/* Dark appearance fallback for the renderer's own tokens. Values match
+   getDerivedDarkColors("#1e40af") (packages/types/dark-palette.ts); styles.ts
+   overrides them from the survey's styling. See survey-ui globals.css. */
+#fbjs[data-appearance="dark"] {
+  color-scheme: dark;
+  --fb-brand-text-color: white;
+  --fb-border-color: #5b6a97;
+  --fb-border-color-highlight: #6b79a1;
+  --fb-heading-color: #dde2f3;
+  --fb-subheading-color: #dde2f3;
+  --fb-placeholder-color: #9fa5b9;
+  --fb-info-text-color: #9fa5b9;
+  --fb-signature-text-color: #b1b5c2;
+  --fb-branding-text-color: #9b9eaa;
+  --fb-survey-background-color: #0d1426;
+  --fb-survey-border-color: #111e45;
+  /* Tailwind's default border color (compat rule at the top of this file). */
+  --color-gray-200: #111e45;
+  --fb-accent-background-color: #101d42;
+  --fb-accent-background-color-selected: #122251;
+  --fb-input-background-color: #0e1832;
+  --fb-input-background-color-selected: #1a243c;
+  --fb-brand-readable-color: #788ccf;
+  --fb-back-button-color: #788ccf;
+  /* The modal shell behind the card; white in light. A `dark:` utility cannot do this: it ties
+     with bg-white on specificity and loses on stylesheet order. */
+  --fb-dialog-background-color: var(--fb-survey-background-color);
+}
+
+@keyframes shrink-width-to-zero {
+  from {
+    width: 100%;
+  }
+
+  to {
+    width: 0%;
+  }
+}
+
+#fbjs .no-scrollbar {
+  -ms-overflow-style: none !important;
+  /* Internet Explorer 10+ */
+  scrollbar-width: thin !important;
+  /* Firefox */
+  scrollbar-color: transparent transparent !important;
+  /* Firefox */
+
+  /* Chrome, Edge, and Safari */
+  &::-webkit-scrollbar {
+    width: 0 !important;
+    background: transparent !important;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: transparent !important;
+  }
+}
+
+#fbjs .grecaptcha-badge {
+  visibility: hidden;
+}

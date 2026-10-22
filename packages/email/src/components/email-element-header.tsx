@@ -1,0 +1,40 @@
+import type { CSSProperties } from "react";
+import { Container } from "react-email";
+import { cn } from "../../src/lib/cn";
+
+interface ElementHeaderProps {
+  /** Rendered as raw HTML. Callers must sanitize it first. */
+  readonly headline: string;
+  /** Rendered as raw HTML. Callers must sanitize it first. */
+  readonly subheader?: string;
+  readonly className?: string;
+  readonly style?: CSSProperties;
+  readonly subheaderStyle?: CSSProperties;
+}
+
+export function ElementHeader({
+  headline,
+  subheader,
+  className,
+  style,
+  subheaderStyle,
+}: ElementHeaderProps): React.JSX.Element {
+  return (
+    <>
+      <Container
+        className={cn("text-question-color m-0 block text-base leading-6 font-semibold", className)}
+        style={style}>
+        <div dangerouslySetInnerHTML={{ __html: headline }} />
+      </Container>
+      {subheader && (
+        <Container
+          className="text-question-color m-0 mt-2 block p-0 text-sm leading-6 font-normal"
+          style={{ ...style, ...subheaderStyle }}>
+          <div dangerouslySetInnerHTML={{ __html: subheader }} />
+        </Container>
+      )}
+    </>
+  );
+}
+
+export default ElementHeader;

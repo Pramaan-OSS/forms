@@ -1,0 +1,181 @@
+post:
+  operationId: validateSurveyV3
+  summary: Validate a survey document
+  description: >
+    Validates a future create or patch survey payload without writing data,
+    creating languages,
+
+    or creating survey versions. Invalid survey documents return `200` with
+    `data.valid=false`
+
+    so agents and MCP clients can repair payloads from structured
+    `invalid_params`.
+
+
+    Use `400` only for malformed validation envelopes, unsupported operations,
+    invalid `surveyId`,
+
+    or unsupported query parameters.
+
+
+    **Custom CSS.** A create or patch payload that carries `customCss` is also run through the custom
+    CSS processor; the result adds the compiled `customCss` and `warnings`, or `errors` and
+    `valid=false`. `operation: customCss` validates CSS alone for a live preview — with
+    `scope: workspace | survey` and, optionally, an existing `surveyId` in `workspaceId` — and returns
+    the compiled CSS and warnings. Validation never saves, versions, touches timestamps or invalidates
+    caches, needs only read access, and grants nothing: the write itself checks permissions and the
+    plan again. Requests that process custom CSS also count against a separate budget of 60 per
+    minute per user or API key, shared with the workspace custom CSS endpoint, with survey creates
+    and updates that add or edit custom CSS, and with the MCP tools; beyond it they return **429**.
+  tags:
+    - V3 Surveys
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: ../components/schemas/ValidateSurveyRequest.yml
+        examples:
+          createValidation:
+            summary: Validate a create payload
+            value:
+              operation: create
+              data:
+                workspaceId: clxx1234567890123456789012
+                name: Product Feedback Survey
+                defaultLanguage: en-US
+                blocks:
+                  - id: clbk1234567890123456789012
+                    name: Main Block
+                    elements:
+                      - id: satisfaction
+                        type: openText
+                        headline:
+                          en-US: What should we improve?
+                        required: true
+          customCssValidation:
+            summary: Validate custom CSS for a live preview
+            value:
+              operation: customCss
+              workspaceId: clxx1234567890123456789012
+              scope: survey
+              surveyId: clsv1234567890123456789012
+              data:
+                customCss:
+                  light: '[data-fb-part="headline"] { font-weight: 600; }'
+                  dark: null
+          patchValidation:
+            summary: Validate a patch payload
+            value:
+              operation: patch
+              surveyId: clsv1234567890123456789012
+              data:
+                blocks:
+                  - id: clbk1234567890123456789012
+                    name: Main Block
+                    elements:
+                      - id: satisfaction
+                        type: openText
+                        headline:
+                          en-US: What should we improve?
+                        required: true
+  responses:
+    "200":
+      description: Validation completed. The survey document may still be invalid.
+      headers:
+        X-Request-Id:
+          schema:
+            type: string
+          description: Request correlation ID
+        Cache-Control:
+          schema:
+            type: string
+          example: private, no-store
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - data
+            properties:
+              data:
+                anyOf:
+                  - $ref: ../components/schemas/SurveyValidationResult.yml
+                  - $ref: ../components/schemas/CustomCssValidationResult.yml
+          examples:
+            invalid:
+              summary: Invalid survey document
+              value:
+                data:
+                  valid: false
+                  operation: create
+                  invalid_params:
+                    - name: blocks.0.elements.0.buttonUrl
+                      reason: >-
+                        Unsupported field 'buttonUrl' for element type
+                        'openText'. Allowed fields...
+            customCssValid:
+              summary: Custom CSS processed, with a removed construct
+              value:
+                data:
+                  valid: true
+                  operation: customCss
+                  invalid_params: []
+                  customCss:
+                    light: '@layer fb-survey { #fbjs [data-fb-part="headline"] { font-weight: 600 !important; } }'
+                    dark: null
+                  warnings:
+                    - code: import_removed
+                      scope: survey
+                      appearance: light
+                      line: 1
+                      column: 1
+                      reason: "@import is not supported and was removed"
+            customCssInvalid:
+              summary: Custom CSS rejected
+              value:
+                data:
+                  valid: false
+                  operation: customCss
+                  invalid_params:
+                    - name: customCss.light
+                      reason: Unexpected end of input (line 3, column 1)
+                  errors:
+                    - code: syntax_error
+                      scope: survey
+                      appearance: light
+                      line: 3
+                      column: 1
+                      reason: Unexpected end of input
+            valid:
+              summary: Valid survey document
+              value:
+                data:
+                  valid: true
+                  operation: create
+                  invalid_params: []
+                  languages:
+                    - code: en-US
+                      default: true
+                      enabled: true
+                      writeBehavior: connect_or_create
+    "400":
+      description: >-
+        Malformed validation envelope, invalid route/query data, or unsupported
+        operation
+      content:
+        application/problem+json:
+          schema:
+            $ref: ../components/schemas/Problem.yml
+    "401":
+      $ref: ../components/responses/V3Unauthorized.yml
+    "403":
+      $ref: ../components/responses/V3Forbidden.yml
+    "429":
+      $ref: ../components/responses/V3TooManyRequests.yml
+    "500":
+      $ref: ../components/responses/V3InternalServerError.yml
+  security:
+    - sessionAuth: []
+    - apiKeyAuth: []
+    - bearerAuth: []

@@ -1,0 +1,100 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: forms
+    ports: ["127.0.0.1:${POSTGRES_PORT:-55436}:5432"]
+    volumes: ["postgres:/var/lib/postgresql"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d forms"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:7.4-bookworm
+    command: redis-server --appendonly yes
+    ports: ["127.0.0.1:${REDIS_PORT:-56336}:6379"]
+    volumes: ["redis:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  permissions-db:
+    image: pgvector/pgvector:pg18
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    environment:
+      POSTGRES_ADMIN_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/forms?sslmode=disable
+      AUTHZED_DATABASE_PASSWORD: ${AUTHZED_DATABASE_PASSWORD}
+    volumes: ["./docker/authzed-postgres-bootstrap.sh:/bootstrap.sh:ro"]
+    depends_on:
+      postgres: { condition: service_healthy }
+  permissions-migrate:
+    image: authzed/spicedb:v1.52.0
+    command: datastore migrate head
+    environment:
+      SPICEDB_DATASTORE_ENGINE: postgres
+      SPICEDB_DATASTORE_CONN_URI: postgresql://spicedb:${AUTHZED_DATABASE_PASSWORD}@postgres:5432/spicedb?sslmode=disable
+    depends_on:
+      permissions-db: { condition: service_completed_successfully }
+  permissions:
+    image: authzed/spicedb:v1.52.0
+    command: serve
+    ports: ["127.0.0.1:${PERMISSIONS_PORT:-55056}:50051"]
+    environment:
+      SPICEDB_DATASTORE_ENGINE: postgres
+      SPICEDB_DATASTORE_CONN_URI: postgresql://spicedb:${AUTHZED_DATABASE_PASSWORD}@postgres:5432/spicedb?sslmode=disable
+      SPICEDB_GRPC_PRESHARED_KEY: ${AUTHZED_TOKEN}
+      SPICEDB_TELEMETRY_ENDPOINT: ""
+      SPICEDB_LOG_LEVEL: warn
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=localhost:50051"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      permissions-migrate: { condition: service_completed_successfully }
+  app:
+    image: node:24.18.0-bookworm
+    working_dir: /app
+    init: true
+    command: ["node", "scripts/container-start.mjs"]
+    env_file: .env
+    environment:
+      FORMS_LOCAL_DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/forms
+      REDIS_URL: redis://redis:6379
+      AUTHZED_ENDPOINT: permissions:50051
+      BULLMQ_WORKER_ENABLED: "1"
+      BULLMQ_EXTERNAL_WORKER_ENABLED: "0"
+      NEXT_TELEMETRY_DISABLED: "1"
+      TURBO_TELEMETRY_DISABLED: "1"
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      FORMS_START_MODE: ${FORMS_START_MODE:-production}
+    ports: ["127.0.0.1:${APP_PORT:-3036}:3000"]
+    volumes:
+      - .:/app
+      - dependencies:/app/node_modules
+      - data:/app/.data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r=>{if(r.status>=500)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 20s
+      retries: 90
+      start_period: 20s
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      permissions: { condition: service_healthy }
+volumes:
+  postgres:
+  redis:
+  dependencies:
+  data:

@@ -1,0 +1,21 @@
+{
+  "exclude": ["../../.env", ".next", "node_modules"],
+  "extends": "./tsconfig.json",
+  "files": ["lib/authorization/contract.typecheck.test.ts", "lib/authzed/index.typecheck.test.ts"],
+  "include": [
+    "next-env.d.ts",
+    "**/*.d.ts",
+    "*.ts",
+    "i18n/**/*.ts",
+    "app/**/*.ts",
+    "app/**/*.tsx",
+    "lib/**/*.ts",
+    "lib/**/*.tsx",
+    "modules/**/*.ts",
+    "modules/**/*.tsx",
+    "playwright/**/*.ts",
+    "scripts/**/*.ts",
+    "scripts/**/*.mts",
+    "../../packages/types/*.d.ts"
+  ]
+}

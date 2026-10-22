@@ -1,0 +1,362 @@
+import "@testing-library/jest-dom/vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { prisma } from "@forms/database";
+import { Prisma } from "@forms/database/prisma";
+import { DatabaseError, ResourceNotFoundError } from "@forms/types/errors";
+import { TSurvey } from "@forms/types/surveys/types";
+import { selectPublicSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
+import { transformPrismaSurvey } from "@/modules/survey/lib/utils";
+import { getResponseBySingleUseId, getSurveyMetadata, getSurveyWithMetadata } from "./data";
+
+vi.mock("server-only", () => ({}));
+
+// Mock dependencies
+vi.mock("@/modules/survey/lib/utils", () => ({
+  transformPrismaSurvey: vi.fn(),
+}));
+
+vi.mock("@forms/database", () => ({
+  prisma: {
+    survey: {
+      findUnique: vi.fn(),
+    },
+    organizationBilling: {
+      findUnique: vi.fn(),
+    },
+    response: {
+      findFirst: vi.fn(),
+    },
+  },
+}));
+
+// Mock React cache
+vi.mock("react", () => ({
+  cache: vi.fn((fn) => fn),
+}));
+
+describe("data", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  describe("getSurveyWithMetadata", () => {
+    const mockSurveyData = {
+      id: "survey-1",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      name: "Test Survey",
+      type: "link",
+      workspaceId: "ws-1",
+      createdBy: "user-1",
+      status: "inProgress",
+      welcomeCard: {
+        enabled: true,
+        timeToFinish: false,
+        showResponseCount: false,
+        headline: { default: "Welcome" },
+        subheader: { default: "" },
+        buttonLabel: { default: "Start" },
+      },
+      questions: [],
+      endings: [],
+      hiddenFields: {},
+      variables: [],
+      displayOption: "displayOnce",
+      recontactDays: null,
+      displayLimit: null,
+      autoClose: null,
+      delay: 0,
+      displayPercentage: null,
+      autoComplete: null,
+      isVerifyEmailEnabled: false,
+      redirectUrl: null,
+      pin: null,
+      isBackButtonHidden: false,
+      isAutoProgressingEnabled: true,
+      singleUse: null,
+      workspaceOverwrites: null,
+      styling: null,
+      surveyClosedMessage: null,
+      showLanguageSwitch: null,
+      recaptcha: null,
+      languages: [],
+      triggers: [],
+      segment: null,
+      followUps: [],
+      inlineTriggers: [],
+      segmentId: null,
+    };
+
+    const mockTransformedSurvey = {
+      ...mockSurveyData,
+      displayPercentage: null,
+      segment: null,
+    } as unknown as TSurvey;
+
+    test("should fetch and transform survey data successfully", async () => {
+      const surveyId = "survey-1";
+
+      vi.mocked(prisma.survey.findUnique).mockResolvedValue(mockSurveyData as any);
+      vi.mocked(transformPrismaSurvey).mockReturnValue(mockTransformedSurvey);
+
+      const result = await getSurveyWithMetadata(surveyId);
+
+      expect(result).toEqual(mockTransformedSurvey);
+      expect(prisma.survey.findUnique).toHaveBeenCalledWith({
+        where: { id: surveyId },
+        select: expect.objectContaining({
+          id: true,
+          name: true,
+          type: true,
+        }),
+      });
+      expect(vi.mocked(prisma.survey.findUnique).mock.calls[0][0].select).toEqual(
+        expect.objectContaining({
+          isAutoProgressingEnabled: true,
+        })
+      );
+      expect(transformPrismaSurvey).toHaveBeenCalledWith(mockSurveyData);
+    });
+
+    /**
+     * ENG-1845: this payload is the renderer's allow-list for link surveys. `getSurveyEmbeddedFields`
+     * fails closed, so a select that loses the join is indistinguishable from a survey with no fields
+     * — and every value in the URL would be silently dropped instead of ingested.
+     *
+     * Pinned to the *public* selector on purpose: an anonymous respondent has no use for the
+     * workspace-library row id, so swapping this for the write-path selector is a regression even
+     * though every field the renderer reads would still be there.
+     */
+    test("carries the Embedded Data join, which is the renderer's ingest allow-list", async () => {
+      const surveyId = "survey-1";
+      vi.mocked(prisma.survey.findUnique).mockResolvedValue(mockSurveyData as any);
+      vi.mocked(transformPrismaSurvey).mockReturnValue(mockTransformedSurvey);
+
+      await getSurveyWithMetadata(surveyId);
+
+      expect(vi.mocked(prisma.survey.findUnique).mock.calls[0][0].select).toEqual(
+        expect.objectContaining({ embeddedDataLinks: selectPublicSurveyEmbeddedDataLinks })
+      );
+    });
+
+    test("should throw ResourceNotFoundError when survey not found", async () => {
+      const surveyId = "nonexistent-survey";
+
+      vi.mocked(prisma.survey.findUnique).mockResolvedValue(null);
+
+      await expect(getSurveyWithMetadata(surveyId)).rejects.toThrow(ResourceNotFoundError);
+      await expect(getSurveyWithMetadata(surveyId)).rejects.toThrow("Survey");
+    });
+
+    test("should throw DatabaseError on Prisma error", async () => {
+      const surveyId = "survey-1";
+      const prismaError = new Prisma.PrismaClientKnownRequestError("Database error", {
+        code: "P2025",
+        clientVersion: "5.0.0",
+      });
+
+      vi.mocked(prisma.survey.findUnique).mockRejectedValue(prismaError);
+
+      await expect(getSurveyWithMetadata(surveyId)).rejects.toThrow(DatabaseError);
+    });
+
+    test("should rethrow non-Prisma errors", async () => {
+      const surveyId = "survey-1";
+      const genericError = new Error("Generic error");
+
+      vi.mocked(prisma.survey.findUnique).mockRejectedValue(genericError);
+
+      await expect(getSurveyWithMetadata(surveyId)).rejects.toThrow(genericError);
+    });
+  });
+
+  describe("getSurveyMetadata", () => {
+    const mockFullSurvey = {
+      id: "survey-1",
+      type: "link",
+      status: "inProgress",
+      workspaceId: "ws-1",
+      name: "Test Survey",
+      styling: { primaryColor: "#000" },
+      // Additional fields that should not be in metadata
+      questions: [],
+      welcomeCard: { enabled: true },
+      createdAt: new Date(),
+    } as unknown as TSurvey;
+
+    test("should extract metadata from full survey", async () => {
+      const surveyId = "survey-1";
+
+      // Mock the survey data that getSurveyWithMetadata would return
+      const mockSurveyData = {
+        id: "survey-1",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        name: "Test Survey",
+        type: "link",
+        workspaceId: "ws-1",
+        createdBy: "user-1",
+        status: "inProgress",
+        styling: { primaryColor: "#000" },
+        // Add other required fields
+        welcomeCard: { enabled: true },
+        questions: [],
+        endings: [],
+        hiddenFields: {},
+        variables: [],
+        displayOption: "displayOnce",
+        recontactDays: null,
+        displayLimit: null,
+        autoClose: null,
+        delay: 0,
+        displayPercentage: null,
+        autoComplete: null,
+        isVerifyEmailEnabled: false,
+        redirectUrl: null,
+        pin: null,
+        isBackButtonHidden: false,
+        isAutoProgressingEnabled: true,
+        singleUse: null,
+        workspaceOverwrites: null,
+        surveyClosedMessage: null,
+        showLanguageSwitch: null,
+        recaptcha: null,
+        languages: [],
+        triggers: [],
+        segment: null,
+        followUps: [],
+      };
+
+      vi.mocked(prisma.survey.findUnique).mockResolvedValue(mockSurveyData as any);
+      vi.mocked(transformPrismaSurvey).mockReturnValue(mockFullSurvey);
+
+      const result = await getSurveyMetadata(surveyId);
+
+      expect(result).toEqual({
+        id: "survey-1",
+        type: "link",
+        status: "inProgress",
+        workspaceId: "ws-1",
+        name: "Test Survey",
+        styling: { primaryColor: "#000" },
+      });
+
+      // Ensure it doesn't contain other fields
+      expect(result).not.toHaveProperty("questions");
+      expect(result).not.toHaveProperty("welcomeCard");
+      expect(result).not.toHaveProperty("createdAt");
+    });
+  });
+
+  describe("getResponseBySingleUseId", () => {
+    const mockResponse = {
+      id: "response-1",
+      finished: true,
+      createdAt: new Date(),
+      data: { answer1: "test" },
+    };
+
+    test("should find response by single use ID", async () => {
+      const surveyId = "survey-1";
+      const singleUseId = "single-use-1";
+
+      vi.mocked(prisma.response.findFirst).mockResolvedValue(mockResponse as any);
+
+      const result = await getResponseBySingleUseId(surveyId, singleUseId)();
+
+      expect(result).toEqual(mockResponse);
+      expect(prisma.response.findFirst).toHaveBeenCalledWith({
+        where: {
+          surveyId,
+          singleUseId,
+        },
+        select: {
+          id: true,
+          finished: true,
+          createdAt: true,
+          data: true,
+        },
+      });
+    });
+
+    test("should return null when response not found", async () => {
+      const surveyId = "survey-1";
+      const singleUseId = "nonexistent-single-use";
+
+      vi.mocked(prisma.response.findFirst).mockResolvedValue(null);
+
+      const result = await getResponseBySingleUseId(surveyId, singleUseId)();
+
+      expect(result).toBeNull();
+    });
+
+    test("should throw DatabaseError on Prisma error", async () => {
+      const surveyId = "survey-1";
+      const singleUseId = "single-use-1";
+      const prismaError = new Prisma.PrismaClientKnownRequestError("Database error", {
+        code: "P2025",
+        clientVersion: "5.0.0",
+      });
+
+      vi.mocked(prisma.response.findFirst).mockRejectedValue(prismaError);
+
+      await expect(getResponseBySingleUseId(surveyId, singleUseId)()).rejects.toThrow(DatabaseError);
+    });
+
+    test("should rethrow non-Prisma errors", async () => {
+      const surveyId = "survey-1";
+      const singleUseId = "single-use-1";
+      const genericError = new Error("Generic error");
+
+      vi.mocked(prisma.response.findFirst).mockRejectedValue(genericError);
+
+      await expect(getResponseBySingleUseId(surveyId, singleUseId)()).rejects.toThrow(genericError);
+    });
+  });
+});
+
+/**
+ * ENG-1838. The link-survey page renders through a bundled `packages/surveys`, so this payload is
+ * never version-skewed the way an embedded SDK bundle is — but the shape is still a contract the
+ * renderer's recall and logic engines read. ENG-2404 dropped the two columns it came from, so
+ * `variables` / `hiddenFields` are now derived from the Embedded Data rows by `transformPrismaSurvey`
+ * (mocked in this file) — which makes the rows in the select the whole contract.
+ */
+describe("legacy Embedded Data shape on the wire (ENG-1838)", () => {
+  test("the link-survey query asks for the rows the legacy keys are derived from", async () => {
+    vi.mocked(prisma.survey.findUnique).mockResolvedValue({ id: "survey-1" } as never);
+    vi.mocked(transformPrismaSurvey).mockReturnValue({ id: "survey-1" } as never);
+
+    await getSurveyWithMetadata("survey-1");
+
+    const [call] = vi.mocked(prisma.survey.findUnique).mock.calls;
+    const select = (call[0] as { select: Record<string, unknown> }).select;
+
+    expect(select.embeddedDataLinks).toEqual(selectPublicSurveyEmbeddedDataLinks);
+  });
+
+  test("transformPrismaSurvey derives both legacy keys from those rows", async () => {
+    const actual = await vi.importActual<typeof import("@/modules/survey/lib/utils")>(
+      "@/modules/survey/lib/utils"
+    );
+    const survey = actual.transformPrismaSurvey<TSurvey>({
+      id: "survey-1",
+      embeddedDataLinks: [
+        {
+          storageKey: "plan",
+          embeddedData: {
+            key: null,
+            name: "plan",
+            source: "ingested",
+            dataType: "string",
+            defaultValue: null,
+            locked: false,
+          },
+        },
+      ],
+    });
+
+    expect(survey.variables).toEqual([]);
+    expect(survey.hiddenFields).toEqual({ enabled: true, fieldIds: ["plan"] });
+  });
+});

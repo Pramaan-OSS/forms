@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true,
+    "types": ["node"]
+  },
+  "exclude": ["node_modules"],
+  "extends": "@forms/config-typescript/js-library.json",
+  "include": ["src", "tests", "package.json"]
+}

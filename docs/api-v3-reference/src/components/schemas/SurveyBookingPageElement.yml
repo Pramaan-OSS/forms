@@ -1,0 +1,25 @@
+allOf:
+  - $ref: ./SurveyElementBase.yml
+  - type: object
+    properties:
+      type:
+        type: string
+        enum:
+          - cal
+        description: Persisted booking question discriminator, retained for saved surveys.
+      bookingUrl:
+        type: string
+        maxLength: 2048
+        description: Operator-hosted HTTPS booking page URL, without credentials. Empty while off.
+      bookingEnabled:
+        type: boolean
+        description: Off for new questions. A valid booking page URL is needed when enabled.
+      calUserName:
+        type: string
+        deprecated: true
+        description: Saved page path or full URL; read compatibility only.
+      calHost:
+        type: string
+        deprecated: true
+        description: Saved operator host; read compatibility only.
+unevaluatedProperties: false

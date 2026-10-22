@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@forms/ai",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "homepage": "/",
+  "description": "Generation over the platform model capabilities for Forms",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "/"
+  },
+  "keywords": [
+    "Forms",
+    "ai",
+    "llm"
+  ],
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "clean": "rimraf .turbo node_modules coverage dist",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "lint:report": "eslint . --format json --output-file ../../lint-results/ai.json",
+    "typecheck": "tsc --noEmit",
+    "build": "rimraf dist && vite build && tsc --project tsconfig.build.json",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "author": "Forms <hola@forms.com>",
+  "dependencies": {
+    "@forms/pramaan": "workspace:*",
+    "@forms/logger": "workspace:*",
+    "@forms/types": "workspace:*",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@forms/config-eslint": "workspace:*",
+    "@forms/config-typescript": "workspace:*",
+    "@vitest/coverage-v8": "catalog:",
+    "rimraf": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

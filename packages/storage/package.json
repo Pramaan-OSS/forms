@@ -1,0 +1,42 @@
+{
+  "name": "@forms/storage",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "File storage for Forms, served through Pramaan",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "scripts": {
+    "clean": "rimraf .turbo node_modules coverage dist",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "lint:report": "eslint . --format json --output-file ../../lint-results/storage.json",
+    "typecheck": "tsc --noEmit",
+    "build": "vite build && tsc --project tsconfig.build.json",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "go": "vite build --watch --mode dev"
+  },
+  "dependencies": {
+    "@forms/pramaan": "workspace:*",
+    "@forms/logger": "workspace:*"
+  },
+  "devDependencies": {
+    "@forms/config-eslint": "workspace:*",
+    "@forms/config-typescript": "workspace:*",
+    "@vitest/coverage-v8": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

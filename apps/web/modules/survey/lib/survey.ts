@@ -1,0 +1,137 @@
+import { cache as reactCache } from "react";
+import { prisma } from "@forms/database";
+import { Prisma } from "@forms/database/prisma";
+import { DatabaseError, ResourceNotFoundError } from "@forms/types/errors";
+import "@forms/types/organizations";
+import { TSurvey } from "@forms/types/surveys/types";
+import { selectSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
+import { getOrganizationBillingRecord } from "@/modules/survey/lib/billing";
+import { transformPrismaSurvey } from "@/modules/survey/lib/utils";
+
+export const selectSurvey = {
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+  name: true,
+  type: true,
+  workspaceId: true,
+  createdBy: true,
+  // ENG-3282: part of TSurvey, so the editor's client-side ZSurvey check needs them on the row.
+  visibility: true,
+  ownerId: true,
+  visibilityVersion: true,
+  visibilityProjectedVersion: true,
+  visibilityChangedAt: true,
+  visibilityChangedById: true,
+  status: true,
+  welcomeCard: true,
+  questions: true,
+  blocks: true,
+  endings: true,
+  displayOption: true,
+  recontactDays: true,
+  displayLimit: true,
+  autoClose: true,
+  delay: true,
+  displayPercentage: true,
+  autoComplete: true,
+  publishOn: true,
+  closeOn: true,
+  isVerifyEmailEnabled: true,
+  isCaptureIpEnabled: true,
+  isAnonymizeResponsesEnabled: true,
+  redirectUrl: true,
+  workspaceOverwrites: true,
+  styling: true,
+  surveyClosedMessage: true,
+  singleUse: true,
+  pin: true,
+  showLanguageSwitch: true,
+  autoSelectLanguage: true,
+  recaptcha: true,
+  isBackButtonHidden: true,
+  isAutoProgressingEnabled: true,
+  metadata: true,
+  slug: true,
+  customHeadScripts: true,
+  customHeadScriptsMode: true,
+  // ENG-2949: the editor round-trips it; the save path reads only its source and reprocesses on change.
+  customCss: true,
+  languages: {
+    select: {
+      default: true,
+      enabled: true,
+      language: {
+        select: {
+          id: true,
+          createdAt: true,
+          updatedAt: true,
+          code: true,
+          workspaceId: true,
+          alias: true,
+        },
+      },
+    },
+  },
+  triggers: {
+    select: {
+      actionClass: {
+        select: {
+          id: true,
+          createdAt: true,
+          updatedAt: true,
+          workspaceId: true,
+          name: true,
+          description: true,
+          type: true,
+          key: true,
+          noCodeConfig: true,
+        },
+      },
+    },
+  },
+  segment: {
+    select: {
+      id: true,
+      createdAt: true,
+      updatedAt: true,
+      workspaceId: true,
+      title: true,
+      description: true,
+      isPrivate: true,
+      filters: true,
+      surveys: {
+        select: {
+          id: true,
+        },
+      },
+    },
+  },
+  followUps: true,
+  // ENG-1837: the definitions every reader resolves through, joined and inlined by
+  // `transformPrismaSurvey`. Read-only — the rows are written by `reconcileEmbeddedData`.
+  embeddedDataLinks: selectSurveyEmbeddedDataLinks,
+} satisfies Prisma.SurveySelect;
+
+export const getOrganizationBilling = getOrganizationBillingRecord;
+
+export const getSurvey = reactCache(async (surveyId: string): Promise<TSurvey> => {
+  try {
+    const survey = await prisma.survey.findUnique({
+      where: { id: surveyId },
+      select: selectSurvey,
+    });
+
+    if (!survey) {
+      throw new ResourceNotFoundError("Survey", surveyId);
+    }
+
+    return transformPrismaSurvey<TSurvey>(survey);
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      throw new DatabaseError(error.message);
+    }
+
+    throw error;
+  }
+});

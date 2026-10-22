@@ -1,0 +1,174 @@
+import { LEAKY_AI_ERRORS, findPlantedContent } from "@/lib/ai/__mocks__/leaky-ai-errors";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { AIOutputTokenLimitError } from "@forms/ai";
+import { logger } from "@forms/logger";
+import { PramaanError } from "@forms/pramaan";
+import { OperationNotAllowedError, ResourceNotFoundError, TooManyRequestsError } from "@forms/types/errors";
+import { mapV3SurveyGenerateError } from "./error-mapping";
+import { V3SurveyGeneratePromptError, V3SurveyGeneratedPayloadValidationError } from "./service";
+
+vi.mock("server-only", () => ({}));
+
+// The mapper only needs the AI error-code union from this module; the real one pulls in env,
+// organization lookups and license checks.
+vi.mock("@/lib/ai/service", () => ({
+  AI_ERROR_CODES: {
+    FEATURES_NOT_ENABLED: "ai_features_not_enabled",
+    SMART_TOOLS_DISABLED: "ai_smart_tools_disabled",
+    INSTANCE_NOT_CONFIGURED: "ai_instance_not_configured",
+    QUOTA_EXCEEDED: "ai_quota_exceeded",
+  },
+}));
+
+vi.mock("@forms/logger", () => ({
+  logger: { error: vi.fn(), withContext: vi.fn(() => ({ warn: vi.fn(), error: vi.fn() })) },
+}));
+
+const context = {
+  requestId: "req_123",
+  instance: "/api/v3/surveys/generate",
+  workspaceId: "clxx1234567890123456789012",
+  organizationId: "org_123",
+};
+
+const readProblem = async (response: Response) =>
+  (await response.json()) as { status: number; code?: string; invalid_params?: unknown };
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe("mapV3SurveyGenerateError", () => {
+  test("maps a thin prompt to 400 and passes the invalid params through", async () => {
+    const invalidParams = [{ name: "prompt", reason: "Prompt needs more detail" }];
+
+    const response = mapV3SurveyGenerateError(new V3SurveyGeneratePromptError(invalidParams), context);
+
+    expect(response.status).toBe(400);
+    await expect(readProblem(response)).resolves.toMatchObject({ invalid_params: invalidParams });
+  });
+
+  test("maps provider rate limiting to 429 with Retry-After", () => {
+    const response = mapV3SurveyGenerateError(new TooManyRequestsError("rate limited", 30), context);
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("30");
+  });
+
+  test("maps an unconfigured instance to 503 and other AI codes to 403", async () => {
+    const notConfigured = mapV3SurveyGenerateError(
+      new OperationNotAllowedError("ai_instance_not_configured"),
+      context
+    );
+    const disabled = mapV3SurveyGenerateError(
+      new OperationNotAllowedError("ai_smart_tools_disabled"),
+      context
+    );
+
+    expect(notConfigured.status).toBe(503);
+    expect(disabled.status).toBe(403);
+    await expect(readProblem(disabled)).resolves.toMatchObject({ code: "ai_smart_tools_disabled" });
+  });
+
+  test("does not treat an unrelated OperationNotAllowedError as an AI-unavailable problem", () => {
+    const response = mapV3SurveyGenerateError(new OperationNotAllowedError("something else"), context);
+
+    expect(response.status).toBe(502);
+  });
+
+  test("maps an invalid generated payload to 422 with its own code", async () => {
+    const invalidParams = [{ name: "elements", reason: "unsupported element type" }];
+
+    const response = mapV3SurveyGenerateError(
+      new V3SurveyGeneratedPayloadValidationError(invalidParams),
+      context
+    );
+
+    expect(response.status).toBe(422);
+    await expect(readProblem(response)).resolves.toMatchObject({
+      code: "ai_generated_payload_invalid",
+      invalid_params: invalidParams,
+    });
+  });
+
+  test("maps hitting the output token limit to 422 ai_output_too_long", async () => {
+    const response = mapV3SurveyGenerateError(
+      new AIOutputTokenLimitError({ maxOutputTokens: 8192, outputTokens: 8192 }),
+      context
+    );
+
+    expect(response.status).toBe(422);
+    await expect(readProblem(response)).resolves.toMatchObject({ code: "ai_output_too_long" });
+  });
+
+  /**
+   * The organization behind a workspace the caller already reached. Answering 404 put a server-derived id
+   * in the body as `resource_id`, against `problemNotFound`'s own contract; 403 is what every other v3
+   * surface says for a resource the caller may not see.
+   */
+  test("maps a missing organization to 403, without naming the organization", async () => {
+    const response = mapV3SurveyGenerateError(new ResourceNotFoundError("Organization", "org_123"), context);
+
+    expect(response.status).toBe(403);
+    const problem = await readProblem(response);
+    expect(problem).toMatchObject({ code: "forbidden" });
+    expect(JSON.stringify(problem)).not.toContain("org_123");
+  });
+
+  test("falls back to 502 and logs where it failed, never the message that can echo the prompt", () => {
+    const error = new Error("provider exploded on secret-from-the-prompt");
+
+    const response = mapV3SurveyGenerateError(error, context);
+
+    expect(response.status).toBe(502);
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        errName: "Error",
+        errStack: expect.stringMatching(/^ +at \S.*(?:\n +at \S.*)*$/),
+        requestId: context.requestId,
+      }),
+      "Failed to generate v3 survey create payload"
+    );
+    expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain("secret-from-the-prompt");
+  });
+
+  // ENG-3720: what falls through to the 502 is usually an AI SDK error, which carries the prompt and the
+  // model's output in its message and fields.
+  test.each(LEAKY_AI_ERRORS)("logs none of what %s carried", (_, build) => {
+    const error = build();
+
+    const response = mapV3SurveyGenerateError(error, context);
+
+    expect(response.status).toBe(502);
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ errName: error.name, requestId: context.requestId }),
+      "Failed to generate v3 survey create payload"
+    );
+    expect(findPlantedContent(vi.mocked(logger.error).mock.calls)).toBeUndefined();
+  });
+
+  test("does not report a rate-limited call as rejected credentials", async () => {
+    // The service layer turns this into a TooManyRequestsError before it reaches here; this guards
+    // the raw classification so a 429 can never fall into the credentials branch.
+    const response = mapV3SurveyGenerateError(
+      new PramaanError("rate_limited", "slow down", { retryable: true, retryAfterMs: 4000, status: 429 }),
+      context
+    );
+
+    const problem = (await response.json()) as { code?: string; detail?: string };
+    expect(problem.code).not.toBe("ai_provider_auth_failed");
+    expect(problem.detail).not.toContain("credentials");
+  });
+
+  test("maps a rejected key to 502 ai_provider_auth_failed instead of prompt advice", async () => {
+    const response = mapV3SurveyGenerateError(
+      new PramaanError("unauthorized", "bad key", { status: 401 }),
+      context
+    );
+
+    expect(response.status).toBe(502);
+    const problem = (await response.json()) as { code?: string; detail?: string };
+    expect(problem.code).toBe("ai_provider_auth_failed");
+    expect(problem.detail).not.toContain("add more detail");
+  });
+});

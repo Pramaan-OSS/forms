@@ -1,0 +1,477 @@
+# Validation suite for the canonical Forms authorization schema.
+#
+# Run with `pnpm authzed:validate` (offline; uses `zed validate`, which shares
+# its parser and evaluator with SpiceDB — no running server required).
+#
+# Every scenario covers the retained template permissions after paid team restrictions
+# were removed. Each section names the application rule it encodes;
+# a failing assertion means a schema change altered the effective permissions
+# of the current authorization system and must not ship unreviewed.
+#
+# Fixture graph:
+#   organization:acme
+#     owner   user:olivia         manager user:mark
+#     member  user:mia            (no team — can read and edit workspace content)
+#     billing user:bella          (billing surfaces only — AND on team:product, see below)
+#     member  user:tom, user:tina, user:uma   (the team users; every TeamUser row in the
+#                                              product has a matching Membership, so the
+#                                              fixture models that rather than team rows
+#                                              floating free of the organization)
+#     api_key_reader api_key:org_reader_key   (accessControl.read)
+#     api_key_writer api_key:org_writer_key   (accessControl.write)
+#   workspace:main, workspace:other            (both owned by acme)
+#   team:product   admin user:tom, contributor user:tina, contributor user:bella
+#                                                          -> readWrite on workspace:main
+#     bella is on this team deliberately. Without that row the scenario-2 billing assertions
+#     only prove the teamless case, and the schema could grant a billing member every workspace
+#     their teams reach while this suite stayed green — which is exactly what it used to do.
+#   team:analysts  contributor user:uma, contributor user:ghost
+#                                                          -> read      on workspace:main
+#     ghost holds a team row but NO membership in acme — the state legacy denies at
+#     `if (!orgMembership) return false;` before it reaches the team ladder. No application path
+#     creates it today (every TeamUser write is org-validated), so this is defence in depth: the
+#     schema states the invariant instead of inheriting it from the writers.
+#   api_key:ci_reader                                     -> read      on workspace:main
+#   api_key:ci_writer                                     -> write     on workspace:main
+#   api_key:ci_manager                                    -> manage    on workspace:main
+#   team:ops       contributor user:mo                    -> manage    on workspace:main
+#   survey:onboarding (workspace:main), survey:internal (workspace:other) — both workspace-visible,
+#     so each carries the day-one identity `#shared_workspace@<its workspace>`
+#   ENG-3282 private surveys, all in workspace:main:
+#     survey:draft     private, owner user:tina    (readWrite through team:product)
+#     survey:orphaned  private, no owner           (the author's account is gone)
+#     survey:stranded  private, owner user:mia     (holds no team, so no workspace read)
+#   survey:leaky (workspace:main) with a FORGED `#shared_workspace@workspace:foreign` edge, where
+#     workspace:foreign belongs to organization:globex (owner user:gary). Documents why the projector
+#     must derive that edge from `Survey.workspaceId` alone: the edge alone hands another tenant read.
+#   dashboard:insights (workspace:main)
+#   response:r1 (survey:onboarding), response:r2 (survey:draft)
+
+schemaFile: schema.zed
+
+relationships: |-
+  organization:acme#owner@user:olivia
+  organization:acme#manager@user:mark
+  organization:acme#member@user:mia
+  organization:acme#billing@user:bella
+  organization:acme#member@user:tom
+  organization:acme#member@user:tina
+  organization:acme#member@user:uma
+  organization:acme#api_key_reader@api_key:org_reader_key
+  organization:acme#api_key_writer@api_key:org_writer_key
+  api_key:org_reader_key#organization@organization:acme
+  api_key:org_writer_key#organization@organization:acme
+  api_key:ci_reader#organization@organization:acme
+  api_key:ci_writer#organization@organization:acme
+  api_key:ci_manager#organization@organization:acme
+  workspace:main#organization@organization:acme
+  workspace:other#organization@organization:acme
+  team:product#organization@organization:acme
+  team:product#admin@user:tom
+  team:product#contributor@user:tina
+  team:product#contributor@user:bella
+  team:analysts#organization@organization:acme
+  team:analysts#contributor@user:uma
+  team:analysts#contributor@user:ghost
+  workspace:main#writer_team@team:product#member
+  workspace:main#reader_team@team:analysts#member
+  workspace:main#reader@api_key:ci_reader
+  workspace:main#writer@api_key:ci_writer
+  workspace:main#manager@api_key:ci_manager
+  feedback_directory:customer_feedback#organization@organization:acme
+  feedback_directory:customer_feedback#assignment@feedback_directory_assignment:fdwa_main
+  feedback_directory_assignment:fdwa_main#directory@feedback_directory:customer_feedback
+  feedback_directory_assignment:fdwa_main#workspace@workspace:main
+  organization:acme#member@user:mo
+  team:ops#organization@organization:acme
+  team:ops#contributor@user:mo
+  workspace:main#manager_team@team:ops#member
+  survey:onboarding#workspace@workspace:main
+  survey:onboarding#shared_workspace@workspace:main
+  survey:internal#workspace@workspace:other
+  survey:internal#shared_workspace@workspace:other
+  survey:draft#workspace@workspace:main
+  survey:draft#owner@user:tina
+  survey:draft#private_owner@user:tina
+  survey:orphaned#workspace@workspace:main
+  survey:stranded#workspace@workspace:main
+  survey:stranded#owner@user:ghost
+  survey:stranded#private_owner@user:ghost
+  organization:globex#owner@user:gary
+  workspace:foreign#organization@organization:globex
+  survey:leaky#workspace@workspace:main
+  survey:leaky#shared_workspace@workspace:foreign
+  dashboard:insights#workspace@workspace:main
+  response:r1#survey@survey:onboarding
+  response:r2#survey@survey:draft
+
+assertions:
+  assertTrue:
+    # Released 6.0 checks retain their workspace semantics during overlap.
+    - survey:draft#read@user:uma
+    - survey:draft#read@api_key:ci_reader
+    - response:r2#read@user:uma
+    # ------------------------------------------------------------------
+    # Scenario 1 — Owner and manager broad access.
+    # Org owners and managers have full product access to every workspace
+    # (organization.manage), and both manage
+    # members, billing, and API keys. Only the owner may update/delete the
+    # organization itself (verifyUserRoleAccess).
+    # ------------------------------------------------------------------
+    - organization:acme#write@user:olivia
+    - organization:acme#manage@user:olivia
+    - organization:acme#manage@user:mark
+    - organization:acme#manage_access@user:olivia
+    - organization:acme#manage_access@user:mark
+    - organization:acme#manage_api_keys@user:mark
+    - organization:acme#manage_api_keys@user:olivia
+    - organization:acme#manage_billing@user:mark
+    # ENG-2409: read_access is the "holds a product-eligible membership role" permission, and it
+    # now gates five organization settings pages. Its owner/manager arms were never asserted —
+    # only the member arm below was — so the permission could have narrowed without a red suite.
+    - organization:acme#read_access@user:olivia
+    - organization:acme#read_access@user:mark
+    - workspace:main#manage@user:olivia
+    - workspace:main#manage@user:mark
+    - workspace:other#read@user:olivia
+    - workspace:other#manage@user:mark
+    - survey:onboarding#manage_v2@user:olivia
+    - survey:onboarding#delete_v2@user:olivia
+    - survey:onboarding#response_read_v2@user:mark
+    - survey:onboarding#response_export_v2@user:mark
+    - response:r1#write_v2@user:olivia
+    - response:r1#manage_v2@user:mark
+    - response:r1#export_v2@user:olivia
+    - dashboard:insights#read@user:mark
+    - dashboard:insights#write@user:mark
+    - api_key:org_reader_key#manage@user:olivia
+    - api_key:org_reader_key#manage@user:mark
+    - feedback_directory:customer_feedback#manage@user:olivia
+    - feedback_directory:customer_feedback#manage@user:mark
+    - feedback_directory:customer_feedback#write@user:tina
+    - feedback_directory:customer_feedback#read@user:uma
+    - feedback_directory:customer_feedback#read@api_key:ci_reader
+    - feedback_directory_assignment:fdwa_main#write@user:tina
+    - feedback_directory_assignment:fdwa_main#read@api_key:ci_reader
+    # Members keep organization visibility (they belong to it) …
+    - organization:acme#read@user:mia
+    - organization:acme#read_access@user:mia
+    - team:product#read@user:mia
+
+    # ------------------------------------------------------------------
+    # Scenario 2 — Billing role blocked from product data.
+    # The billing role reaches billing surfaces only; every product gate
+    # (`workspace.read`) excludes it.
+    # ------------------------------------------------------------------
+    - organization:acme#read@user:bella
+    - organization:acme#manage_billing@user:bella
+
+    # ------------------------------------------------------------------
+    # Scenario 3 — Team-based workspace access.
+    # Members retain workspace access without team assignments.
+    # WorkspaceTeam readWrite grants create/edit (and read); manage-level
+    # operations stay out of reach. Team admins manage the team itself.
+    # ------------------------------------------------------------------
+    - workspace:main#write@user:tina
+    - workspace:main#read@user:tina
+    - survey:onboarding#read_v2@user:tina
+    - survey:onboarding#write_v2@user:tina
+    - survey:onboarding#delete_v2@user:tina
+    - survey:onboarding#publish_v2@user:tina
+    - survey:onboarding#response_read_v2@user:tina
+    - survey:onboarding#response_export_v2@user:tina
+    - response:r1#write_v2@user:tina
+    - dashboard:insights#read@user:tina
+    - dashboard:insights#write@user:tina
+    - team:product#manage@user:tom
+    - team:product#member@user:tom
+    - team:product#read@user:tina
+
+    # ------------------------------------------------------------------
+    # Scenario 4 — Members with saved read-level team grants.
+    # Team restrictions are retired; their organization membership grants content
+    # access. Export equals read and administration remains restricted.
+    # ------------------------------------------------------------------
+    - workspace:main#read@user:uma
+    - survey:onboarding#read_v2@user:uma
+    - survey:onboarding#response_read_v2@user:uma
+    - survey:onboarding#response_export_v2@user:uma
+    - response:r1#read_v2@user:uma
+    - response:r1#export_v2@user:uma
+
+    # ------------------------------------------------------------------
+    # Scenario 5 — Dashboard read derives from workspace read.
+    # Dashboards carry no ACL of their own; whoever can read the
+    # workspace can read its dashboards (checkWorkspaceAccess).
+    # ------------------------------------------------------------------
+    - dashboard:insights#read@user:uma
+    - dashboard:insights#read@user:olivia
+    - dashboard:insights#read@api_key:ci_reader
+
+    # ------------------------------------------------------------------
+    # Scenario 6 — API key as scoped principal.
+    # A workspace-scoped key acts only inside its granted workspace at its
+    # granted level (read -> GET). Organization-level accessControl rights
+    # govern org access-control endpoints and grant no product access.
+    # ------------------------------------------------------------------
+    - workspace:main#read@api_key:ci_reader
+    - survey:onboarding#read_v2@api_key:ci_reader
+    - survey:onboarding#response_read_v2@api_key:ci_reader
+    - survey:onboarding#response_export_v2@api_key:ci_reader
+    - organization:acme#read@api_key:org_reader_key
+    - organization:acme#read@api_key:org_writer_key
+    - organization:acme#read_access@api_key:org_reader_key
+    - organization:acme#read_access@api_key:org_writer_key
+    - organization:acme#manage_access@api_key:org_writer_key
+    - team:product#read@api_key:org_reader_key
+    - team:product#read@api_key:org_writer_key
+    - team:product#manage@api_key:org_writer_key
+    - team:product#delete@api_key:org_writer_key
+    - workspace:main#write@api_key:ci_writer
+    - survey:onboarding#write_v2@api_key:ci_writer
+    - survey:onboarding#delete_v2@api_key:ci_writer
+    - dashboard:insights#write@api_key:ci_writer
+    - response:r1#write_v2@api_key:ci_writer
+    - workspace:main#manage@api_key:ci_manager
+    - survey:onboarding#manage_v2@api_key:ci_manager
+    - survey:onboarding#delete_v2@api_key:ci_manager
+    - dashboard:insights#write@api_key:ci_manager
+    - response:r1#manage_v2@api_key:ci_manager
+
+    # Scenario 7 (ENG-3282) — a private survey is reachable by its owner, along the owner's own
+    # workspace ladder, and by organization owners and managers.
+    - survey:draft#read_v2@user:tina
+    - survey:draft#write_v2@user:tina
+    - survey:draft#delete_v2@user:tina
+    - survey:draft#publish_v2@user:tina
+    - survey:draft#response_read_v2@user:tina
+    - survey:draft#response_export_v2@user:tina
+    - survey:draft#change_visibility@user:tina
+    - response:r2#read_v2@user:tina
+    - survey:draft#read_v2@user:olivia
+    - survey:draft#manage_v2@user:mark
+    - survey:draft#change_visibility@user:mark
+    - response:r2#export_v2@user:mark
+    # An ownerless private survey stays recoverable by an administrator (Decision log #3).
+    - survey:orphaned#read_v2@user:mark
+    - survey:orphaned#change_visibility@user:olivia
+    # Administrators may change a workspace-visible survey's visibility too.
+    - survey:onboarding#change_visibility@user:mark
+    # The hazard the survey audit exists to catch: a forged `shared_workspace` edge naming another
+    # organization's workspace grants that organization's members read on this survey.
+    - survey:leaky#read_v2@user:gary
+
+    # Members can read and edit workspace content without paid team grants.
+    - workspace:main#read@user:mia
+    - survey:onboarding#read_v2@user:mia
+    - dashboard:insights#read@user:mia
+    - feedback_directory:customer_feedback#read@user:mia
+    - feedback_directory_assignment:fdwa_main#write@user:uma
+    - workspace:other#read@user:tina
+    - survey:internal#read_v2@user:tina
+    - workspace:main#write@user:uma
+    - survey:onboarding#write_v2@user:uma
+    - survey:onboarding#delete_v2@user:uma
+    - survey:onboarding#publish_v2@user:uma
+    - response:r1#write_v2@user:uma
+    - dashboard:insights#write@user:uma
+    - workspace:other#read@user:uma
+    - survey:internal#read_v2@user:uma
+    - workspace:main#write@user:mia
+  assertFalse:
+    # Content access does not grant administration or cross-organization access.
+    - workspace:main#manage@user:mia
+    - workspace:foreign#read@user:mia
+    - workspace:foreign#write@user:mia
+    # Scenario 7 (ENG-3282) — nobody else reaches a private survey, and change_visibility is never
+    # workspace write, team-level manage, or an API key.
+    - survey:draft#read_v2@user:uma
+    - survey:draft#read_v2@user:tom
+    - survey:draft#read_v2@user:mo
+    - survey:draft#read_v2@user:bella
+    - survey:draft#read_v2@user:mia
+    - survey:draft#read_v2@api_key:ci_reader
+    - survey:draft#read_v2@api_key:ci_manager
+    - survey:draft#response_read_v2@api_key:ci_manager
+    - response:r2#read_v2@user:uma
+    - response:r2#export_v2@api_key:ci_manager
+    # The owner's own ladder still applies: readWrite does not become manage by owning a survey.
+    - survey:draft#manage_v2@user:tina
+    - survey:draft#change_visibility@user:uma
+    - survey:draft#change_visibility@api_key:ci_manager
+    - survey:orphaned#read_v2@user:tina
+    - survey:orphaned#read_v2@user:mo
+    - survey:orphaned#change_visibility@user:mo
+    # An owner who no longer holds workspace read loses the survey and the control (Decision 2).
+    - survey:stranded#read_v2@user:ghost
+    - survey:stranded#change_visibility@user:ghost
+    # R-10: workspace write and team-level manage never change visibility, even on a visible survey.
+    - survey:onboarding#change_visibility@user:tina
+    - survey:onboarding#change_visibility@user:mo
+    - survey:onboarding#change_visibility@api_key:ci_manager
+    - survey:leaky#change_visibility@user:gary
+
+    # Scenario 1 — managers must not update/delete the organization itself;
+    # members have workspace content access but cannot administer the organization.
+    - organization:acme#write@user:mark
+    - organization:acme#write@user:mia
+    - organization:acme#manage@user:mia
+    - organization:acme#manage_access@user:mia
+    - organization:acme#manage_api_keys@user:mia
+    # ENG-2409: the enterprise settings page maps `isMember -> notFound` onto `manage_billing`, and
+    # that mapping is only correct because a plain member does not hold it. `manage_billing` had no
+    # assertFalse anywhere — both mentions were assertTrue — so adding `+ member` to it in the schema
+    # would have kept this suite green while opening the billing surface to every member. Same shape
+    # as the read_access gap closed above.
+    - organization:acme#manage_billing@user:mia
+    - api_key:org_reader_key#manage@user:mia
+    - feedback_directory:customer_feedback#read@user:bella
+    - feedback_directory:customer_feedback#manage@user:tina
+    - feedback_directory_assignment:fdwa_main#manage@user:tina
+    - feedback_directory_assignment:fdwa_main#read@api_key:org_writer_key
+
+    # Scenario 2 — billing is excluded from every product surface and from
+    # member/API-key management.
+    #
+    # bella holds a `team:product` contributor row, so these prove the exclusion survives team
+    # membership rather than only holding for a billing user who happens to be on no team. The
+    # first assertion pins the mechanism (`team#member` intersects the organization's non-billing
+    # membership); the rest are the product surfaces that would open if it regressed.
+    - team:product#member@user:bella
+    - organization:acme#manage@user:bella
+    - organization:acme#write@user:bella
+    - organization:acme#manage_access@user:bella
+    - organization:acme#manage_api_keys@user:bella
+    # ENG-2409: the load-bearing one. `read_access` is the only permission whose expansion is
+    # "holds a product-eligible membership role", which is what makes it the central expression of
+    # "not the billing role" — and it is what five organization settings pages now gate on. Until
+    # this line existed the suite had NO assertFalse for read_access at all, so adding `billing` to
+    # it in the schema kept every assertion green. Exactly the shape of the ENG-2340 gap: a
+    # guarantee written in prose and asserted nowhere.
+    - organization:acme#read_access@user:bella
+    - workspace:main#read@user:bella
+    - survey:onboarding#read_v2@user:bella
+    - survey:onboarding#response_read_v2@user:bella
+    - response:r1#read_v2@user:bella
+    - response:r1#write_v2@user:bella
+    - response:r1#manage_v2@user:bella
+    - response:r1#export_v2@user:bella
+    - dashboard:insights#read@user:bella
+    - dashboard:insights#write@user:bella
+
+    # A team row without a membership in the team's organization grants nothing, mirroring
+    # legacy's `if (!orgMembership) return false;` ahead of the team ladder.
+    - team:analysts#member@user:ghost
+    - workspace:main#read@user:ghost
+    - survey:onboarding#read_v2@user:ghost
+    - response:r1#export_v2@user:ghost
+
+    # Scenario 3 — workspace content access does not grant workspace or team management.
+    - workspace:main#manage@user:tina
+    - workspace:main#share@user:tina
+    - response:r1#manage_v2@user:tina
+    - team:product#manage@user:tina
+    - team:product#delete@user:tom
+
+    # Scenario 4 — members can write content but do not gain workspace management.
+    - survey:onboarding#manage_v2@user:uma
+    - response:r1#manage_v2@user:uma
+    - team:product#member@user:uma
+
+    # Scenario 5 — organization-only API keys do not gain workspace data access.
+    - dashboard:insights#read@api_key:org_writer_key
+
+    # Scenario 6 — workspace keys must not exceed their level or workspace;
+    # organization-only keys have no product access; accessControl.read
+    # does not include accessControl.write.
+    - workspace:main#write@api_key:ci_reader
+    - workspace:main#manage@api_key:ci_reader
+    - workspace:main#share@api_key:ci_reader
+    - survey:onboarding#delete_v2@api_key:ci_reader
+    - dashboard:insights#write@api_key:ci_reader
+    - response:r1#write_v2@api_key:ci_reader
+    - response:r1#manage_v2@api_key:ci_reader
+    - workspace:main#manage@api_key:ci_writer
+    - survey:onboarding#manage_v2@api_key:ci_writer
+    - response:r1#manage_v2@api_key:ci_writer
+    - workspace:other#read@api_key:ci_reader
+    - survey:internal#read_v2@api_key:ci_reader
+    - workspace:main#read@api_key:org_writer_key
+    - workspace:main#read@api_key:org_reader_key
+    - survey:onboarding#read_v2@api_key:org_writer_key
+    - organization:acme#manage_access@api_key:org_reader_key
+    - team:product#manage@api_key:org_reader_key
+    - team:product#delete@api_key:org_reader_key
+    - organization:acme#manage_api_keys@api_key:org_writer_key
+    # ENG-2409: a workspace-scoped key holds no organization-level access-control right. Asserted
+    # because `read_access` gained org-page gates and its api_key arm is granted by the
+    # `api_key_reader`/`api_key_writer` relations on the organization, which ci_reader lacks.
+    - organization:acme#read_access@api_key:ci_reader
+
+# Expected-relations documentation: enumerates, for key permissions, every
+# subject that holds them and through which relation. Kept exact so any
+# schema change that widens or narrows these permissions shows up as a diff.
+validation:
+  workspace:main#read:
+    - "[user:mia] is <organization:acme#member>"
+    - "[api_key:ci_reader] is <workspace:main#reader>"
+    - "[api_key:ci_writer] is <workspace:main#writer>"
+    - "[api_key:ci_manager] is <workspace:main#manager>"
+    - "[team:analysts#member] is <workspace:main#reader_team>"
+    - "[team:ops#member] is <workspace:main#manager_team>"
+    - "[team:product#member] is <workspace:main#writer_team>"
+    - "[user:mark] is <organization:acme#manager>"
+    - "[user:mo] is <organization:acme#member>/<team:ops#contributor>"
+    - "[user:olivia] is <organization:acme#owner>"
+    - "[user:tina] is <organization:acme#member>/<team:product#contributor>"
+    - "[user:tom] is <organization:acme#member>/<team:product#admin>"
+    - "[user:uma] is <organization:acme#member>/<team:analysts#contributor>"
+  # ENG-2409: both of these became organization page gates, so enumerate their subjects here as
+  # well. The assertions above prove the roles that must and must not hold them; this block is what
+  # turns a *widening* into a visible diff rather than a still-green suite.
+  organization:acme#read_access:
+    - "[api_key:org_reader_key] is <organization:acme#api_key_reader>"
+    - "[api_key:org_writer_key] is <organization:acme#api_key_writer>"
+    - "[user:mark] is <organization:acme#manager>"
+    - "[user:mia] is <organization:acme#member>"
+    - "[user:mo] is <organization:acme#member>"
+    - "[user:olivia] is <organization:acme#owner>"
+    - "[user:tina] is <organization:acme#member>"
+    - "[user:tom] is <organization:acme#member>"
+    - "[user:uma] is <organization:acme#member>"
+  organization:acme#manage_api_keys:
+    - "[user:mark] is <organization:acme#manager>"
+    - "[user:olivia] is <organization:acme#owner>"
+  # ENG-2409: `read` backs the getOrganizationAuth tenancy gate and `manage_billing` backs the
+  # enterprise settings page, so both are page-gate permissions now and both are enumerated for the
+  # same reason as the two above — an assertion proves a role holds it, only this block makes a
+  # *widening* show up as a diff.
+  organization:acme#read:
+    - "[api_key:org_reader_key] is <organization:acme#api_key_reader>"
+    - "[api_key:org_writer_key] is <organization:acme#api_key_writer>"
+    - "[user:bella] is <organization:acme#billing>"
+    - "[user:mark] is <organization:acme#manager>"
+    - "[user:mia] is <organization:acme#member>"
+    - "[user:mo] is <organization:acme#member>"
+    - "[user:olivia] is <organization:acme#owner>"
+    - "[user:tina] is <organization:acme#member>"
+    - "[user:tom] is <organization:acme#member>"
+    - "[user:uma] is <organization:acme#member>"
+  organization:acme#manage_billing:
+    - "[user:bella] is <organization:acme#billing>"
+    - "[user:mark] is <organization:acme#manager>"
+    - "[user:olivia] is <organization:acme#owner>"
+  response:r1#export_v2:
+    - "[user:mia] is <organization:acme#member>"
+    - "[api_key:ci_reader] is <workspace:main#reader>"
+    - "[api_key:ci_writer] is <workspace:main#writer>"
+    - "[api_key:ci_manager] is <workspace:main#manager>"
+    - "[team:analysts#member] is <workspace:main#reader_team>"
+    - "[team:ops#member] is <workspace:main#manager_team>"
+    - "[team:product#member] is <workspace:main#writer_team>"
+    - "[user:mark] is <organization:acme#manager>"
+    - "[user:mo] is <organization:acme#member>/<team:ops#contributor>"
+    - "[user:olivia] is <organization:acme#owner>"
+    - "[user:tina] is <organization:acme#member>/<team:product#contributor>"
+    - "[user:tom] is <organization:acme#member>/<team:product#admin>"
+    - "[user:uma] is <organization:acme#member>/<team:analysts#contributor>"

@@ -1,0 +1,135 @@
+import type { AuthInfo, CallToolResult } from "@modelcontextprotocol/server";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { registerScopedTool } from "./guard-scopes";
+
+vi.mock("@forms/logger", () => ({
+  logger: { withContext: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }) },
+}));
+vi.mock("@/modules/auth/lib/oauth-urls", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/modules/auth/lib/oauth-urls")>()),
+  getMcpResourceUrl: () => "https://app.test/api/mcp",
+}));
+
+// The insufficient-scope shape the guard puts on structuredContent — narrowed from `unknown`.
+type ScopeErrorContent = {
+  error: { status: number; code: string; detail: string; requestId: string };
+};
+
+// A minimal stand-in for McpServer that captures what registerScopedTool registers.
+function createToolServer() {
+  const tools = new Map<
+    string,
+    { config: Record<string, unknown>; handler: (input: unknown, extra: unknown) => Promise<CallToolResult> }
+  >();
+  const server = {
+    registerTool: vi.fn((name: string, config: Record<string, unknown>, handler: any) => {
+      tools.set(name, { config, handler });
+    }),
+  };
+  return { server, tools };
+}
+
+/** An API-key principal as `authenticateMcpRequest` attaches it — what `getMcpAuthentication` reads. */
+
+function authInfoWithScopes(scopes: string[], requestId = "req_guard", authentication?: unknown): AuthInfo {
+  return {
+    token: "tok",
+    clientId: "client",
+    scopes,
+    extra: { requestId, ...(authentication ? { formsAuthentication: authentication } : {}) },
+  } as unknown as AuthInfo;
+}
+
+const CONFIG = {
+  title: "Do thing",
+  description: "A guarded tool",
+  annotations: { readOnlyHint: false },
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe("registerScopedTool", () => {
+  test("registers the tool under its name with the config untouched", () => {
+    const { server, tools } = createToolServer();
+
+    registerScopedTool(server as any, "do_thing", CONFIG, ["surveys:write"], vi.fn() as any);
+
+    expect(server.registerTool).toHaveBeenCalledTimes(1);
+    expect(server.registerTool.mock.calls[0][0]).toBe("do_thing");
+    expect(tools.get("do_thing")?.config).toBe(CONFIG);
+  });
+
+  test("runs the handler and returns its result when the token holds every required scope", async () => {
+    const { server, tools } = createToolServer();
+    const handlerResult = { structuredContent: { ok: true } } as unknown as CallToolResult;
+    const handler = vi.fn().mockResolvedValue(handlerResult);
+    registerScopedTool(server as any, "do_thing", CONFIG, ["surveys:read", "surveys:write"], handler as any);
+
+    const input = { a: 1 };
+    const ctx = { http: { authInfo: authInfoWithScopes(["surveys:read", "surveys:write"]) } };
+    const result = await tools.get("do_thing")!.handler(input, ctx);
+
+    expect(handler).toHaveBeenCalledWith(input, ctx);
+    expect(result).toBe(handlerResult);
+  });
+
+  test("blocks the handler with a 403 insufficient-scope result when a required scope is missing", async () => {
+    const { server, tools } = createToolServer();
+    const handler = vi.fn();
+    registerScopedTool(server as any, "do_thing", CONFIG, ["surveys:write"], handler as any);
+
+    const result = await tools
+      .get("do_thing")!
+      .handler({}, { http: { authInfo: authInfoWithScopes(["surveys:read"], "req_denied") } });
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    expect((result.structuredContent as ScopeErrorContent).error).toMatchObject({
+      status: 403,
+      code: "forbidden",
+      // The missing scope must be in the body: this result reaches the client as a JSON-RPC payload
+      // with no headers, so the WWW-Authenticate challenge cannot tell it what to re-authorize for.
+      detail: "OAuth token does not include the required MCP scope: surveys:write",
+      requestId: "req_denied",
+    });
+  });
+
+  test("denies when the token holds only some of several required scopes", async () => {
+    const { server, tools } = createToolServer();
+    const handler = vi.fn();
+    registerScopedTool(server as any, "do_thing", CONFIG, ["surveys:read", "surveys:write"], handler as any);
+
+    const result = await tools
+      .get("do_thing")!
+      .handler({}, { http: { authInfo: authInfoWithScopes(["surveys:read"]) } });
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    // Every required scope is listed, not just the first one that failed.
+    expect((result.structuredContent as ScopeErrorContent).error.detail).toContain(
+      "surveys:read surveys:write"
+    );
+  });
+});
+
+/**
+ * The ENG-2119 invariant, as a test rather than a convention.
+ *
+ * `registerScopedTool` takes the scope as a required argument, so the compiler already stops a tool
+ * being registered without one — verified separately, and `tsc` reports `Expected 5 arguments, but
+ * got 4`. What the compiler cannot stop is someone re-exporting the raw guards and gating by hand
+ * inside a handler again, which is exactly how the guarantee was lost the first time: the
+ * feedback-record tools did that for ten tools, and nothing failed.
+ *
+ * So this pins the module's public surface. If a guard is exported again, this is the test that says
+ * the structural gate just became conventional.
+ */
+describe("the scope guards stay private (ENG-2119)", () => {
+  test("registerScopedTool is the only export", async () => {
+    const guardScopes = await import("./guard-scopes");
+
+    expect(Object.keys(guardScopes).sort()).toEqual(["registerScopedTool"]);
+  });
+});

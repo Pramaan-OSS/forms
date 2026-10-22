@@ -1,0 +1,60 @@
+import "server-only";
+import { createCacheKey } from "@forms/cache";
+import { prisma } from "@forms/database";
+import { TJsWorkspaceState } from "@forms/types/js";
+import {
+  addLegacyProjectOverwritesToList,
+  addLegacyProjectToEnvironmentState,
+} from "@/app/lib/api/api-backwards-compat";
+import { cache } from "@/lib/cache";
+import { IS_RECAPTCHA_CONFIGURED, RECAPTCHA_SITE_KEY } from "@/lib/constants";
+import { getWorkspaceStateData } from "./data";
+
+/**
+ * Optimized environment state fetcher using new caching approach
+ * Uses withCache for Redis-backed caching with graceful fallback
+ * Single database query via optimized data service
+ *
+ * @param workspaceId - The workspace ID to fetch state for
+ * @returns The environment state
+ * @throws ResourceNotFoundError if workspace not found
+ */
+export const getWorkspaceState = async (
+  workspaceId: string
+): Promise<{ data: TJsWorkspaceState["data"] }> => {
+  return cache.withCache(
+    async () => {
+      // Single optimized database call replacing multiple service calls
+      const { workspace, surveys, actionClasses } = await getWorkspaceStateData(workspaceId);
+
+      // Handle app setup completion update if needed
+      // This is a one-time setup flag that can tolerate TTL-based cache expiration
+      if (!workspace.appSetupCompleted) {
+        await prisma.workspace.update({
+          where: { id: workspaceId },
+          data: { appSetupCompleted: true },
+        });
+      }
+
+      // The legacy `project` alias below would otherwise repeat the workspace custom CSS (up to 100 KB)
+      // in the same response. Only SDKs from before the rename read `project`, and none of them knows
+      // custom CSS, so the alias leaves it out and the CSS is sent exactly once (ENG-3552).
+      const { customCss: _workspaceCustomCss, ...legacyProjectSettings } = workspace.workspaceSettings;
+
+      // Build the response data
+      // Backwards compat: include `project` alongside `workspace`, and
+      // `projectOverwrites` alongside `workspaceOverwrites` in each survey
+      const data = addLegacyProjectToEnvironmentState({
+        surveys: addLegacyProjectOverwritesToList(surveys),
+        actionClasses,
+        workspace: workspace.workspaceSettings,
+        project: legacyProjectSettings,
+        ...(IS_RECAPTCHA_CONFIGURED ? { recaptchaSiteKey: RECAPTCHA_SITE_KEY } : {}),
+      } as TJsWorkspaceState["data"]);
+
+      return { data };
+    },
+    createCacheKey.workspace.state(workspaceId),
+    60 * 1000 // 1 minute in milliseconds
+  );
+};

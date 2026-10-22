@@ -1,0 +1,4 @@
+CREATE TABLE "ResponseTextAnalysis" (
+  "responseId" TEXT NOT NULL PRIMARY KEY REFERENCES "Response"("id") ON DELETE CASCADE ON UPDATE CASCADE,
+  "data" JSONB NOT NULL
+);

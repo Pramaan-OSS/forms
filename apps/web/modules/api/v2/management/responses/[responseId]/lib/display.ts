@@ -1,0 +1,41 @@
+import { prisma } from "@forms/database";
+import { Prisma } from "@forms/database/prisma";
+import { PrismaErrorType } from "@forms/database/types/error";
+import { Result, err, ok } from "@forms/types/error-handlers";
+import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
+
+export const deleteDisplay = async (displayId: string): Promise<Result<boolean, ApiErrorResponseV2>> => {
+  try {
+    await prisma.display.delete({
+      where: {
+        id: displayId,
+      },
+      select: {
+        id: true,
+        contactId: true,
+        surveyId: true,
+      },
+    });
+
+    return ok(true);
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      if (
+        error.code === PrismaErrorType.RelatedRecordNotFound ||
+        error.code === PrismaErrorType.RecordNotFound
+      ) {
+        return err({
+          type: "not_found",
+          details: [{ field: "display", issue: "not found" }],
+        });
+      }
+    }
+
+    return err({
+      type: "internal_server_error",
+      details: [
+        { field: "display", issue: error instanceof Error ? error.message : "Unknown error occurred" },
+      ],
+    });
+  }
+};

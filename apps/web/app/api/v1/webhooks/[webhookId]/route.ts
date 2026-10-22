@@ -1,0 +1,91 @@
+import { logger } from "@forms/logger";
+import { deleteWebhook, getWebhook } from "@/app/api/v1/webhooks/[webhookId]/lib/webhook";
+import {
+  addLegacyEnvironmentId,
+  addLegacyEnvironmentIdBestEffort,
+} from "@/app/lib/api/legacy-environment-id";
+import { responses } from "@/app/lib/api/response";
+import { THandlerParams, withV1ApiWrapper } from "@/app/lib/api/with-api-logging";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
+
+export const GET = withV1ApiWrapper({
+  handler: async ({ props, authentication }: THandlerParams<{ params: Promise<{ webhookId: string }> }>) => {
+    if (!authentication || !("apiKeyId" in authentication)) {
+      return { response: responses.notAuthenticatedResponse() };
+    }
+
+    const params = await props.params;
+
+    const webhook = await getWebhook(params.webhookId);
+    if (!webhook) {
+      return {
+        response: responses.notFoundResponse("Webhook", params.webhookId),
+      };
+    }
+    if (
+      !(await can(
+        { type: "apiKey", id: authentication.apiKeyId },
+        getWorkspaceAuthorizationActionForMethod("GET"),
+        { type: "workspace", id: webhook.workspaceId }
+      ))
+    ) {
+      return {
+        response: responses.unauthorizedResponse(),
+      };
+    }
+    return {
+      response: responses.successResponse(await addLegacyEnvironmentId(webhook)),
+    };
+  },
+});
+
+export const DELETE = withV1ApiWrapper({
+  handler: async ({
+    req,
+    props,
+    authentication,
+  }: THandlerParams<{ params: Promise<{ webhookId: string }> }>) => {
+    if (!authentication || !("apiKeyId" in authentication)) {
+      return { response: responses.notAuthenticatedResponse() };
+    }
+
+    const params = await props.params;
+
+    // check if webhook exists
+    const webhook = await getWebhook(params.webhookId);
+    if (!webhook) {
+      return {
+        response: responses.notFoundResponse("Webhook", params.webhookId),
+      };
+    }
+    if (
+      !(await can(
+        { type: "apiKey", id: authentication.apiKeyId },
+        getWorkspaceAuthorizationActionForMethod("DELETE"),
+        { type: "workspace", id: webhook.workspaceId }
+      ))
+    ) {
+      return {
+        response: responses.unauthorizedResponse(),
+      };
+    }
+
+    // delete webhook from database
+    let deletedWebhook: Awaited<ReturnType<typeof deleteWebhook>>;
+    try {
+      deletedWebhook = await deleteWebhook(params.webhookId);
+    } catch (e) {
+      logger.error({ error: e, url: req.url }, "Error deleting webhook");
+      return {
+        response: responses.notFoundResponse("Webhook", params.webhookId),
+      };
+    }
+
+    // Enrich outside the delete's try/catch: the webhook is already gone, so a lookup failure here
+    // must not report a failed delete (a false 404 plus a "failure" audit entry).
+    return {
+      response: responses.successResponse(await addLegacyEnvironmentIdBestEffort(deletedWebhook)),
+    };
+  },
+});

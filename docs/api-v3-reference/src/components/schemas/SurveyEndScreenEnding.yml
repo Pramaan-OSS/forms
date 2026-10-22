@@ -1,0 +1,34 @@
+type: object
+description: Visual end screen displayed after survey completion.
+required:
+  - id
+  - type
+properties:
+  id:
+    type: string
+    format: cuid2
+    description: Stable ending id. `jumpToBlock.target` may point to this id.
+  type:
+    type: string
+    enum:
+      - endScreen
+  headline:
+    $ref: ./TranslatableText.yml
+  subheader:
+    $ref: ./TranslatableText.yml
+  buttonLabel:
+    $ref: ./TranslatableText.yml
+  buttonLink:
+    type: string
+  imageUrl:
+    type: string
+  imageAltText:
+    allOf:
+      - $ref: ./TranslatableText.yml
+    description: Text alternative for `imageUrl`, read by screen readers. Omit or leave empty for a decorative image (rendered as `alt=""`).
+  videoUrl:
+    type: string
+  hideDefaultIcon:
+    type: boolean
+    description: Hides the default checkmark icon rendered above the headline when the ending carries no image or video. Omit to keep the icon.
+additionalProperties: false

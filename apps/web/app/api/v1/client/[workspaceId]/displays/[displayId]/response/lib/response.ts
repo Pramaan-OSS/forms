@@ -1,0 +1,44 @@
+import { prisma } from "@forms/database";
+import { Prisma } from "@forms/database/prisma";
+import { ZId } from "@forms/types/common";
+import { DatabaseError, ResourceNotFoundError } from "@forms/types/errors";
+import { validateInputs } from "@/lib/utils/validate";
+
+export const getResponseIdByDisplayId = async (
+  workspaceId: string,
+  displayId: string
+): Promise<{ responseId: string | null }> => {
+  validateInputs([workspaceId, ZId], [displayId, ZId]);
+
+  try {
+    const display = await prisma.display.findFirst({
+      where: {
+        id: displayId,
+        survey: {
+          workspaceId,
+        },
+      },
+      select: {
+        response: {
+          select: {
+            id: true,
+          },
+        },
+      },
+    });
+
+    if (!display) {
+      throw new ResourceNotFoundError("Display", displayId);
+    }
+
+    return {
+      responseId: display.response?.id ?? null,
+    };
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      throw new DatabaseError(error.message);
+    }
+
+    throw error;
+  }
+};

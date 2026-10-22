@@ -1,0 +1,770 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { prisma } from "@forms/database";
+import { Prisma } from "@forms/database/prisma";
+import { logger } from "@forms/logger";
+import { DatabaseError, ResourceNotFoundError } from "@forms/types/errors";
+import { PUBLIC_API_SURVEY_NAME_PLACEHOLDER } from "@forms/types/js-constants";
+import { selectPublicSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
+import { transformPrismaSurvey } from "@/modules/survey/lib/utils";
+import { resolveRespondentCustomCss } from "@/modules/survey/link/lib/respondent-custom-css";
+import { getWorkspaceStateData } from "./data";
+
+vi.mock("server-only", () => ({}));
+
+// Mock dependencies
+vi.mock("@forms/database", () => ({
+  prisma: {
+    workspace: {
+      findUnique: vi.fn(),
+    },
+    segment: {
+      findMany: vi.fn(),
+    },
+  },
+}));
+
+vi.mock("@forms/logger", () => ({
+  logger: {
+    error: vi.fn(),
+  },
+}));
+
+vi.mock("@/lib/utils/validate", () => ({
+  validateInputs: vi.fn(),
+}));
+
+vi.mock("@/modules/storage/utils", () => ({
+  resolveStorageUrlsInObject: vi.fn((obj) => obj),
+}));
+
+vi.mock("@/modules/survey/lib/utils", () => ({
+  transformPrismaSurvey: vi.fn((survey) => survey),
+}));
+
+// No custom CSS unless a test says otherwise (ENG-3552).
+vi.mock("@/modules/survey/link/lib/respondent-custom-css", () => ({
+  resolveRespondentCustomCss: vi.fn(async () => ({ surveys: new Map() })),
+}));
+
+const workspaceId = "cjld2cjxh0000qzrmn831i7rn";
+
+const mockWorkspaceData = {
+  id: workspaceId,
+  appSetupCompleted: true,
+  recontactDays: 30,
+  clickOutsideClose: true,
+  overlay: "none",
+  placement: "bottomRight",
+  inAppSurveyBranding: true,
+  styling: { allowStyleOverwrite: false },
+  actionClasses: [
+    {
+      id: "action-1",
+      type: "code",
+      name: "Test Action",
+      key: "test-action",
+      noCodeConfig: null,
+    },
+  ],
+  surveys: [
+    {
+      id: "survey-1",
+      name: "Test Survey",
+      type: "app",
+      status: "inProgress",
+      welcomeCard: { enabled: false },
+      questions: [],
+      blocks: null,
+      showLanguageSwitch: false,
+      languages: [],
+      endings: [],
+      autoClose: null,
+      styling: null,
+      recaptcha: { enabled: false },
+      segment: null,
+      recontactDays: null,
+      displayLimit: null,
+      displayOption: "displayOnce",
+      embeddedDataLinks: [],
+      isBackButtonHidden: false,
+      triggers: [],
+      displayPercentage: null,
+      delay: 0,
+      workspaceOverwrites: null,
+    },
+  ],
+};
+
+describe("getWorkspaceStateData", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  afterEach(() => {
+    vi.resetAllMocks();
+  });
+
+  test("should return environment state data when workspace exists", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(mockWorkspaceData as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect(result).toEqual({
+      workspace: {
+        id: workspaceId,
+        appSetupCompleted: true,
+        workspaceSettings: {
+          id: workspaceId,
+          recontactDays: 30,
+          clickOutsideClose: true,
+          overlay: "none",
+          placement: "bottomRight",
+          inAppSurveyBranding: true,
+          styling: { allowStyleOverwrite: false },
+        },
+      },
+      // `survey.name` is replaced with a back-compat placeholder; segment was
+      // null in the mock so the sanitized segment stays null.
+      surveys: [
+        {
+          ...mockWorkspaceData.surveys[0],
+          name: PUBLIC_API_SURVEY_NAME_PLACEHOLDER,
+        },
+      ],
+      actionClasses: mockWorkspaceData.actionClasses,
+    });
+
+    expect(prisma.workspace.findUnique).toHaveBeenCalledWith({
+      where: { id: workspaceId },
+      select: expect.objectContaining({
+        id: true,
+        appSetupCompleted: true,
+        recontactDays: true,
+        actionClasses: expect.any(Object),
+        surveys: expect.any(Object),
+      }),
+    });
+  });
+
+  // The assertion above compares against the shared constant, so it moves with any edit to it and
+  // pins nothing. The text itself ships in an unauthenticated public API response, so changing it is
+  // an API change and has to be deliberate: this literal is what such an edit must get past (ENG-2799).
+  test("substitutes the exact placeholder text for every survey name", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(mockWorkspaceData as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect(result.surveys[0].name).toBe(
+      "[deprecated] survey name omitted from public API - will be removed soon"
+    );
+  });
+
+  /**
+   * ENG-1845: this payload is the renderer's allow-list for app surveys. `getSurveyEmbeddedFields`
+   * fails closed, so a select that loses the join is indistinguishable from a survey with no fields
+   * — and every value passed through `setEmbeddedData` or `track({ hiddenFields })` would be silently
+   * dropped instead of ingested. This is where that has to fail.
+   */
+  test("carries the Embedded Data join, which is the renderer's ingest allow-list", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(mockWorkspaceData as never);
+
+    await getWorkspaceStateData(workspaceId);
+
+    const [{ select }] = vi.mocked(prisma.workspace.findUnique).mock.calls[0] as [
+      { select: { surveys: { select: Record<string, unknown> } } },
+    ];
+    // The public selector, not the write-path one: this payload reaches anonymous SDK clients, and
+    // the workspace-library row id is of no use to a renderer.
+    expect(select.surveys.select.embeddedDataLinks).toEqual(selectPublicSurveyEmbeddedDataLinks);
+  });
+
+  test("carries the survey's language settings, which the SDK resolves the display language from", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: [{ ...mockWorkspaceData.surveys[0], autoSelectLanguage: true }],
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    const [{ select }] = vi.mocked(prisma.workspace.findUnique).mock.calls[0] as [
+      { select: { surveys: { select: Record<string, unknown> } } },
+    ];
+    expect(select.surveys.select).toEqual(
+      expect.objectContaining({ showLanguageSwitch: true, autoSelectLanguage: true })
+    );
+    expect(result.surveys[0].autoSelectLanguage).toBe(true);
+  });
+
+  test("should throw ResourceNotFoundError when workspace is not found", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(null);
+
+    await expect(getWorkspaceStateData(workspaceId)).rejects.toThrow(ResourceNotFoundError);
+    await expect(getWorkspaceStateData(workspaceId)).rejects.toThrow("workspace");
+  });
+
+  test("should throw DatabaseError on Prisma database errors", async () => {
+    const prismaError = new Prisma.PrismaClientKnownRequestError("Connection failed", {
+      code: "P2024",
+      clientVersion: "5.0.0",
+    });
+    vi.mocked(prisma.workspace.findUnique).mockRejectedValue(prismaError);
+
+    await expect(getWorkspaceStateData(workspaceId)).rejects.toThrow(DatabaseError);
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  test("should rethrow unexpected errors", async () => {
+    const unexpectedError = new Error("Unexpected error");
+    vi.mocked(prisma.workspace.findUnique).mockRejectedValue(unexpectedError);
+
+    await expect(getWorkspaceStateData(workspaceId)).rejects.toThrow("Unexpected error");
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  test("should handle empty surveys array", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: [],
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect(result.surveys).toEqual([]);
+  });
+
+  test("should handle empty actionClasses array", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      actionClasses: [],
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect(result.actionClasses).toEqual([]);
+  });
+
+  test("should transform surveys using transformPrismaSurvey", async () => {
+    const multipleSurveys = [
+      ...mockWorkspaceData.surveys,
+      {
+        ...mockWorkspaceData.surveys[0],
+        id: "survey-2",
+        name: "Second Survey",
+      },
+    ];
+
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: multipleSurveys,
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect(result.surveys).toHaveLength(2);
+  });
+
+  test("should correctly map workspace properties to workspaceSettings", async () => {
+    const customWorkspace = {
+      ...mockWorkspaceData,
+      recontactDays: 14,
+      clickOutsideClose: false,
+      overlay: "dark",
+      placement: "center",
+      inAppSurveyBranding: false,
+      styling: { allowStyleOverwrite: true, brandColor: "#ff0000" },
+    };
+
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(customWorkspace as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect(result.workspace.workspaceSettings).toEqual({
+      id: workspaceId,
+      recontactDays: 14,
+      clickOutsideClose: false,
+      overlay: "dark",
+      placement: "center",
+      inAppSurveyBranding: false,
+      styling: { allowStyleOverwrite: true, brandColor: "#ff0000" },
+    });
+  });
+
+  test("should validate workspaceId input", async () => {
+    // Invalid CUID should throw validation error
+    await expect(getWorkspaceStateData("invalid-id")).rejects.toThrow();
+  });
+
+  test("should handle appSetupCompleted false", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      appSetupCompleted: false,
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect(result.workspace.appSetupCompleted).toBe(false);
+  });
+
+  test("should not include organization in result", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(mockWorkspaceData as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect(result).not.toHaveProperty("organization");
+  });
+
+  // ENG-1067 back-compat: SDK clients match the display language by exact code, so alongside each
+  // canonical region-tagged code we expose its bare legacy code for multi-language surveys.
+  const buildLanguage = (code: string, isDefault = false) => ({
+    default: isDefault,
+    enabled: true,
+    language: {
+      id: `lang-${code}`,
+      code,
+      alias: null,
+      createdAt: new Date("2024-01-01"),
+      updatedAt: new Date("2024-01-01"),
+      workspaceId,
+    },
+  });
+
+  test("appends bare legacy language codes for multi-language surveys", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: [
+        {
+          ...mockWorkspaceData.surveys[0],
+          languages: [buildLanguage("en-US", true), buildLanguage("de-DE")],
+        },
+      ],
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+    const codes = result.surveys[0].languages.map((sl) => sl.language.code);
+
+    // canonical entries stay first; bare legacy entries are appended
+    expect(codes).toEqual(["en-US", "de-DE", "en", "de"]);
+  });
+
+  test("does not append legacy codes for single-language surveys", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: [{ ...mockWorkspaceData.surveys[0], languages: [buildLanguage("en-US", true)] }],
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+    const codes = result.surveys[0].languages.map((sl) => sl.language.code);
+
+    expect(codes).toEqual(["en-US"]);
+  });
+
+  test("does not duplicate a bare code that a real language already uses", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: [
+        {
+          ...mockWorkspaceData.surveys[0],
+          languages: [buildLanguage("en-US", true), buildLanguage("de-DE"), buildLanguage("de")],
+        },
+      ],
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+    const codes = result.surveys[0].languages.map((sl) => sl.language.code);
+
+    // "de" already present → only "en" gets appended
+    expect(codes).toEqual(["en-US", "de-DE", "de", "en"]);
+  });
+
+  test("appends real legacy aliases (not a region-strip) for alias-mapped codes", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: [
+        {
+          ...mockWorkspaceData.surveys[0],
+          // fil-PH's legacy alias is "tl" (not "fil"); ak-GH has two aliases ("ak", "tw")
+          languages: [buildLanguage("en-US", true), buildLanguage("fil-PH"), buildLanguage("ak-GH")],
+        },
+      ],
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+    const codes = result.surveys[0].languages.map((sl) => sl.language.code);
+
+    expect(codes).toEqual(["en-US", "fil-PH", "ak-GH", "en", "tl", "ak", "tw"]);
+  });
+
+  // Survey-interaction segment gate: per-survey `interactionRefresh`.
+  const interactionSurvey = (id: string, operator: string, targetSurveyId: string) => ({
+    ...mockWorkspaceData.surveys[0],
+    id,
+    segment: {
+      id: `seg-${id}`,
+      filters: [
+        {
+          id: "f1",
+          connector: null,
+          resource: {
+            id: "r1",
+            root: { type: "surveyInteraction" },
+            qualifier: { operator },
+            value: {
+              surveyScope: "specific",
+              surveyIds: [targetSurveyId],
+              within: { amount: 1, unit: "months" },
+            },
+          },
+        },
+      ],
+    },
+  });
+
+  test("attaches per-survey interactionRefresh for an interaction filter", async () => {
+    // survey-B references survey-A via "have seen" → A gets onDisplay only; B (referenced by nobody) all-false.
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: [
+        { ...mockWorkspaceData.surveys[0], id: "survey-A", segment: null },
+        interactionSurvey("survey-B", "haveSeen", "survey-A"),
+      ],
+    } as never);
+    vi.mocked(prisma.segment.findMany).mockResolvedValue([] as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    const byId = Object.fromEntries(result.surveys.map((s) => [s.id, s]));
+    expect((byId["survey-A"] as { interactionRefresh?: unknown }).interactionRefresh).toEqual({
+      onDisplay: true,
+      onResponse: false,
+      onFinished: false,
+    });
+    expect((byId["survey-B"] as { interactionRefresh?: unknown }).interactionRefresh).toEqual({
+      onDisplay: false,
+      onResponse: false,
+      onFinished: false,
+    });
+  });
+
+  test("resolves an interaction filter hidden inside a nested userIsIn segment", async () => {
+    // survey-A's segment only references segment "seg-nested" (userIsIn); that segment holds the
+    // "have completed survey-A" interaction leaf, so A must still be flagged onFinished.
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: [
+        {
+          ...mockWorkspaceData.surveys[0],
+          id: "survey-A",
+          segment: {
+            id: "seg-a",
+            filters: [
+              {
+                id: "f1",
+                connector: null,
+                resource: {
+                  id: "r1",
+                  root: { type: "segment", segmentId: "seg-nested" },
+                  qualifier: { operator: "userIsIn" },
+                  value: "seg-nested",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    } as never);
+    vi.mocked(prisma.segment.findMany).mockResolvedValue([
+      {
+        id: "seg-nested",
+        filters: [
+          {
+            id: "f2",
+            connector: null,
+            resource: {
+              id: "r2",
+              root: { type: "surveyInteraction" },
+              qualifier: { operator: "haveCompleted" },
+              value: {
+                surveyScope: "specific",
+                surveyIds: ["survey-A"],
+                within: { amount: 1, unit: "months" },
+              },
+            },
+          },
+        ],
+      },
+    ] as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect((result.surveys[0] as { interactionRefresh?: unknown }).interactionRefresh).toEqual({
+      onDisplay: false,
+      onResponse: false,
+      onFinished: true,
+    });
+    expect(prisma.segment.findMany).toHaveBeenCalledWith({
+      where: { workspaceId },
+      select: { id: true, filters: true },
+    });
+  });
+
+  test("distinguishes Simplified and Traditional Chinese (script preserved, not a bare 'zh')", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: [
+        {
+          ...mockWorkspaceData.surveys[0],
+          languages: [buildLanguage("en-US", true), buildLanguage("zh-Hans-CN"), buildLanguage("zh-Hant-TW")],
+        },
+      ],
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+    const codes = result.surveys[0].languages.map((sl) => sl.language.code);
+
+    // Each script keeps its own legacy aliases, so a deployed Chinese client matches whichever code it
+    // holds: Simplified -> zh / zh-CN / zh-Hans, Traditional -> zh-Hant / zh-TW. A region-strip would have
+    // emitted a single bare "zh" for both — which no Chinese client holds and can't tell the two apart.
+    expect(codes).toEqual([
+      "en-US",
+      "zh-Hans-CN",
+      "zh-Hant-TW",
+      "en",
+      "zh",
+      "zh-CN",
+      "zh-Hans",
+      "zh-Hant",
+      "zh-TW",
+    ]);
+  });
+});
+
+/**
+ * ENG-1838. Already-deployed SDK bundles on customer sites read `survey.variables` and
+ * `survey.hiddenFields.fieldIds` straight off this payload, and we do not control when a customer
+ * upgrades their embed. ENG-2404 dropped the columns those keys came from, so they are now derived
+ * from the EmbeddedData rows by `transformPrismaSurvey` — which is why these cases run the real
+ * transform rather than the identity mock the rest of this file uses.
+ *
+ * If the derivation ever stops, this fails: without it the payload would quietly stop carrying the
+ * two keys and every old bundle in the wild would break silently.
+ */
+describe("legacy Embedded Data shape on the wire (ENG-1838)", () => {
+  const ingested = (storageKey: string) => ({
+    storageKey,
+    embeddedData: {
+      key: null,
+      name: storageKey,
+      source: "ingested",
+      dataType: "string",
+      defaultValue: null,
+      locked: false,
+    },
+  });
+
+  const surveyWithRows = {
+    ...mockWorkspaceData.surveys[0],
+    embeddedDataLinks: [
+      {
+        storageKey: "clx000000000000000000001",
+        embeddedData: {
+          key: null,
+          name: "score",
+          source: "computed",
+          dataType: "number",
+          defaultValue: 7,
+          locked: false,
+        },
+      },
+      ingested("utm_source"),
+      ingested("plan"),
+    ],
+  };
+
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import("@/modules/survey/lib/utils")>(
+      "@/modules/survey/lib/utils"
+    );
+    vi.mocked(transformPrismaSurvey).mockImplementation(actual.transformPrismaSurvey);
+  });
+
+  test("the workspace-state payload still carries variables and hiddenFields, derived from the rows", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      surveys: [surveyWithRows],
+    } as never);
+
+    const [survey] = (await getWorkspaceStateData(workspaceId)).surveys;
+
+    expect(survey.variables).toEqual([
+      { id: "clx000000000000000000001", name: "score", type: "number", value: 7 },
+    ]);
+    // In row order, which is the order the old bundle iterates `fieldIds` in.
+    expect(survey.hiddenFields).toEqual({ enabled: true, fieldIds: ["utm_source", "plan"] });
+  });
+
+  test("a survey with no rows still carries both keys, empty", async () => {
+    // An old bundle reads `hiddenFields.fieldIds` without a guard, so an absent key is a crash, not
+    // "no hidden fields".
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(mockWorkspaceData as never);
+
+    const [survey] = (await getWorkspaceStateData(workspaceId)).surveys;
+
+    expect(survey.variables).toEqual([]);
+    expect(survey.hiddenFields).toEqual({ enabled: false, fieldIds: [] });
+  });
+});
+
+/**
+ * ENG-3313: the custom overlay rides inside each survey object, because every SDK forwards the raw
+ * survey JSON to `renderSurvey`. `workspaceSettings` is left as it was, so this is the only place the
+ * new values reach the renderer.
+ */
+describe("custom overlay appearance on the wire (ENG-3313)", () => {
+  test("a preset overlay carries no overlayAppearance key", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      overlay: "dark",
+      overlayColor: null,
+      overlayOpacity: null,
+    } as never);
+
+    const [survey] = (await getWorkspaceStateData(workspaceId)).surveys;
+
+    expect(survey).not.toHaveProperty("overlayAppearance");
+  });
+
+  test.each([
+    ["no overlay with a leftover colour", { overlay: "none", overlayColor: "#ff0000", overlayOpacity: 40 }],
+    ["a stored colour that does not parse", { overlay: "dark", overlayColor: "red", overlayOpacity: null }],
+  ])("%s carries no overlayAppearance key", async (_, overlayFields) => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      ...overlayFields,
+    } as never);
+
+    const [survey] = (await getWorkspaceStateData(workspaceId)).surveys;
+
+    expect(survey).not.toHaveProperty("overlayAppearance");
+  });
+
+  test("a survey that does not override the overlay gets the workspace's custom values", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      overlay: "dark",
+      overlayColor: "#ff0000",
+      overlayOpacity: 40,
+      surveys: [{ ...mockWorkspaceData.surveys[0], workspaceOverwrites: { placement: "center" } }],
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect(result.surveys[0].overlayAppearance).toEqual({ color: "#ff0000", opacity: 40 });
+    // The SDK still resolves the enum from here, so it must not change shape.
+    expect(result.workspace.workspaceSettings).not.toHaveProperty("overlayColor");
+    expect(result.workspace.workspaceSettings).not.toHaveProperty("overlayOpacity");
+
+    const [call] = vi.mocked(prisma.workspace.findUnique).mock.calls;
+    const { select } = call[0] as { select: Record<string, unknown> };
+    expect(select.overlayColor).toBe(true);
+    expect(select.overlayOpacity).toBe(true);
+  });
+
+  test("a survey that overrides the overlay uses its own values, never the workspace's", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue({
+      ...mockWorkspaceData,
+      overlay: "dark",
+      overlayColor: "#ff0000",
+      overlayOpacity: 40,
+      surveys: [
+        {
+          ...mockWorkspaceData.surveys[0],
+          id: "custom-survey",
+          workspaceOverwrites: { overlay: "light", overlayColor: null, overlayOpacity: 25 },
+        },
+        {
+          ...mockWorkspaceData.surveys[0],
+          id: "preset-survey",
+          workspaceOverwrites: { overlay: "light" },
+        },
+      ],
+    } as never);
+
+    const result = await getWorkspaceStateData(workspaceId);
+    const byId = Object.fromEntries(result.surveys.map((survey) => [survey.id, survey]));
+
+    expect(byId["custom-survey"].overlayAppearance).toEqual({ color: null, opacity: 25 });
+    // Overriding the overlay with a preset drops the workspace's custom colour along with it.
+    expect(byId["preset-survey"]).not.toHaveProperty("overlayAppearance");
+  });
+});
+
+/**
+ * ENG-3552: respondents get compiled custom CSS only — the workspace's once, in `workspaceSettings`,
+ * each survey's in that survey — and nothing when there is none to deliver. The stored values carry the
+ * editable source, so they must never reach the payload, whatever delivery decides.
+ */
+describe("custom CSS on the wire (ENG-3552)", () => {
+  const storedWorkspaceCss = {
+    light: { source: "/* workspace source */ .a { color: red }", compiled: "@layer fb-workspace {}" },
+    dark: null,
+    processorVersion: 1,
+  };
+  const storedSurveyCss = {
+    light: null,
+    dark: { source: "/* survey source */ .b { color: blue }", compiled: "@layer fb-survey-dark {}" },
+    processorVersion: 1,
+  };
+  const workspaceWithCss = {
+    ...mockWorkspaceData,
+    organizationId: "org-1",
+    customCss: storedWorkspaceCss,
+    surveys: [
+      { ...mockWorkspaceData.surveys[0], id: "styled", customCss: storedSurveyCss },
+      { ...mockWorkspaceData.surveys[0], id: "plain", customCss: null },
+    ],
+  };
+
+  test("sends the workspace CSS once in workspaceSettings and each survey's in that survey", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(workspaceWithCss as never);
+    vi.mocked(resolveRespondentCustomCss).mockResolvedValueOnce({
+      workspace: { light: "@layer fb-workspace {}" },
+      surveys: new Map([["styled", { dark: "@layer fb-survey-dark {}" }]]),
+    });
+
+    const result = await getWorkspaceStateData(workspaceId);
+    const byId = Object.fromEntries(result.surveys.map((survey) => [survey.id, survey]));
+
+    // Resolved from the stored values, with what decides whether each survey's own CSS applies.
+    expect(resolveRespondentCustomCss).toHaveBeenCalledWith({
+      workspaceCustomCss: storedWorkspaceCss,
+      allowStyleOverwrite: false,
+      surveys: [
+        { id: "styled", customCss: storedSurveyCss, styling: mockWorkspaceData.surveys[0].styling },
+        { id: "plain", customCss: null, styling: mockWorkspaceData.surveys[0].styling },
+      ],
+    });
+    expect(result.workspace.workspaceSettings.customCss).toEqual({ light: "@layer fb-workspace {}" });
+    expect(byId.styled.customCss).toEqual({ dark: "@layer fb-survey-dark {}" });
+    expect(byId.plain).not.toHaveProperty("customCss");
+    expect(JSON.stringify(result)).not.toMatch(/source|processorVersion/);
+    expect(prisma.workspace.findUnique).toHaveBeenCalledWith({
+      where: { id: workspaceId },
+      select: expect.objectContaining({
+        organizationId: true,
+        customCss: true,
+        surveys: expect.objectContaining({ select: expect.objectContaining({ customCss: true }) }),
+      }),
+    });
+  });
+
+  test("omits every customCss key when nothing is delivered (no CSS, withheld, or overrides off)", async () => {
+    vi.mocked(prisma.workspace.findUnique).mockResolvedValue(workspaceWithCss as never);
+    vi.mocked(resolveRespondentCustomCss).mockResolvedValueOnce({ surveys: new Map() });
+
+    const result = await getWorkspaceStateData(workspaceId);
+
+    expect(result.workspace.workspaceSettings).not.toHaveProperty("customCss");
+    for (const survey of result.surveys) expect(survey).not.toHaveProperty("customCss");
+    expect(JSON.stringify(result)).not.toMatch(/source|processorVersion/);
+  });
+});

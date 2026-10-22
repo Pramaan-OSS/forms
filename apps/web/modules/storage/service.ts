@@ -1,0 +1,280 @@
+import { randomUUID } from "crypto";
+import { logger } from "@forms/logger";
+import {
+  type FileStreamResult,
+  type StorageError,
+  StorageErrorCode,
+  deleteFile as deleteFileFromStorage,
+  deleteFilesByPrefix,
+  getFileStream,
+  getSignedDownloadUrl,
+  getSignedUploadUrl,
+} from "@forms/storage";
+import { Result, err, ok } from "@forms/types/error-handlers";
+import { type TAccessType } from "@forms/types/storage";
+import { sanitizeFileName } from "./utils";
+
+const SAFE_FILE_PATH_SEGMENT = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Rejects relative path segments in a caller-supplied storage file name.
+ *
+ * Download/delete keys are built as `${id}/${accessType}/${fileName}`, and `fileName` arrives from the
+ * `[...filePath]` route param, so `..` segments let a caller step out of their own
+ * `workspaceId/accessType/` prefix and name another tenant's object — including a `private/` one via
+ * the unauthenticated `public/` route. Object stores treat keys opaquely and SigV4 signs the
+ * unnormalized path, so this does not resolve on a stock S3/MinIO backend; but whether one tenant can
+ * name another's file must not depend on how the storage backend or any proxy in front of it happens
+ * to treat dot segments. `fileName` legitimately contains `/` (upload nests it under
+ * `filePathSegments`), so only the segments themselves are constrained.
+ */
+const hasTraversalSegment = (fileName: string): boolean =>
+  fileName.split("/").some((segment) => segment === "." || segment === "..");
+
+export const getSignedUrlForUpload = async (
+  fileName: string,
+  workspaceId: string,
+  fileType: string,
+  accessType: TAccessType,
+  maxFileUploadSize: number = 1024 * 1024 * 10, // 10MB
+  filePathSegments: string[] = []
+): Promise<
+  Result<
+    {
+      signedUrl: string;
+      /** Always empty: the uploader PUTs the raw bytes to the signed URL. */
+      presignedFields: Record<string, string>;
+      fileUrl: string;
+    },
+    StorageError
+  >
+> => {
+  try {
+    const safeFileName = sanitizeFileName(fileName);
+    if (!safeFileName) {
+      return err({ code: StorageErrorCode.InvalidInput });
+    }
+
+    if (filePathSegments.some((segment) => !SAFE_FILE_PATH_SEGMENT.test(segment))) {
+      return err({ code: StorageErrorCode.InvalidInput });
+    }
+
+    const encodedFilePathSegments = filePathSegments.map((segment) => encodeURIComponent(segment));
+    const fileNameWithoutExtension = safeFileName.split(".").slice(0, -1).join(".");
+    const fileExtension = safeFileName.split(".").pop();
+
+    const updatedFileName = `${fileNameWithoutExtension}--fid--${randomUUID()}.${fileExtension}`;
+    const filePath = [workspaceId, accessType, ...filePathSegments].join("/");
+
+    const signedUrlResult = await getSignedUploadUrl(updatedFileName, fileType, filePath, maxFileUploadSize);
+
+    if (!signedUrlResult.ok) {
+      return signedUrlResult;
+    }
+
+    // Return relative path - can be resolved to absolute URL at runtime when needed
+    return ok({
+      signedUrl: signedUrlResult.data.signedUrl,
+      presignedFields: signedUrlResult.data.presignedFields,
+      fileUrl: `/storage/${workspaceId}/${accessType}/${[
+        ...encodedFilePathSegments,
+        encodeURIComponent(updatedFileName),
+      ].join("/")}`,
+    });
+  } catch (error) {
+    logger.error({ error }, "Error getting signed url for upload");
+
+    return err({
+      code: StorageErrorCode.Unknown,
+    });
+  }
+};
+
+/**
+ * Get a short-lived signed URL for downloading a file, for routes that
+ * redirect the caller to storage instead of proxying bytes.
+ *
+ * Tries the primary ID path first. If the file is not found and a fallbackId is provided,
+ * retries with the fallback path. This supports backwards compatibility: new uploads use
+ * workspaceId paths while old files may still live under environmentId paths.
+ */
+export const getDownloadUrlForDownload = async (
+  fileName: string,
+  primaryId: string,
+  accessType: TAccessType,
+  fallbackId?: string
+): Promise<Result<string, StorageError>> => {
+  try {
+    const fileNameDecoded = decodeURIComponent(fileName);
+
+    // Checked after the decode: the route param is already URL-decoded once, so a `%252e%252e`
+    // traversal only becomes `..` here.
+    if (hasTraversalSegment(fileName) || hasTraversalSegment(fileNameDecoded)) {
+      return err({ code: StorageErrorCode.InvalidInput });
+    }
+
+    const primaryKey = `${primaryId}/${accessType}/${fileNameDecoded}`;
+
+    const urlResult = await getSignedDownloadUrl(primaryKey);
+
+    if (!urlResult.ok && urlResult.error.code === StorageErrorCode.FileNotFoundError && fallbackId) {
+      const fallbackKey = `${fallbackId}/${accessType}/${fileNameDecoded}`;
+      return await getSignedDownloadUrl(fallbackKey);
+    }
+
+    return urlResult;
+  } catch (error) {
+    logger.error({ error }, "Error getting file download URL");
+
+    return err({
+      code: StorageErrorCode.Unknown,
+    });
+  }
+};
+
+/**
+ * Get a file stream for callers that need the bytes themselves (archives).
+ *
+ * Tries the primary ID path first. If the file is not found and a fallbackId is provided,
+ * retries with the fallback path. This supports backwards compatibility: new uploads use
+ * workspaceId paths while old files may still live under environmentId paths.
+ */
+export const getFileStreamForDownload = async (
+  fileName: string,
+  primaryId: string,
+  accessType: TAccessType,
+  fallbackId?: string
+): Promise<Result<FileStreamResult, StorageError>> => {
+  try {
+    const fileNameDecoded = decodeURIComponent(fileName);
+
+    // Checked after the decode: the route param is already URL-decoded once, so a `%252e%252e`
+    // traversal only becomes `..` here.
+    if (hasTraversalSegment(fileName) || hasTraversalSegment(fileNameDecoded)) {
+      return err({ code: StorageErrorCode.InvalidInput });
+    }
+
+    const primaryKey = `${primaryId}/${accessType}/${fileNameDecoded}`;
+
+    const streamResult = await getFileStream(primaryKey);
+
+    if (!streamResult.ok && streamResult.error.code === StorageErrorCode.FileNotFoundError && fallbackId) {
+      const fallbackKey = `${fallbackId}/${accessType}/${fileNameDecoded}`;
+      return await getFileStream(fallbackKey);
+    }
+
+    return streamResult;
+  } catch (error) {
+    logger.error({ error }, "Error getting file stream for download");
+
+    return err({
+      code: StorageErrorCode.Unknown,
+    });
+  }
+};
+
+// Deletes a file from S3. Tries the primary ID path first; if the file is not found and a
+// fallbackId is provided, retries with the fallback path (backwards compat for old environmentId paths).
+export const deleteFile = async (
+  primaryId: string,
+  accessType: TAccessType,
+  fileName: string,
+  fallbackId?: string
+) => {
+  // Same reasoning as the download path: a `..` segment would let an authorized caller delete objects
+  // outside the workspace prefix they were authorized against. An empty segment or a `\` is refused too:
+  // a backend or proxy that merges `//` or maps `\` to `/` would turn `surveys//{other}/…` into another
+  // survey's key. Real keys never hold either, so refusing only leaves an object behind.
+  if (hasTraversalSegment(fileName) || fileName.includes("\\") || fileName.split("/").includes("")) {
+    return err({ code: StorageErrorCode.InvalidInput });
+  }
+
+  const result = await deleteFileFromStorage(`${primaryId}/${accessType}/${fileName}`);
+
+  if (!result.ok && result.error.code === StorageErrorCode.FileNotFoundError && fallbackId) {
+    return await deleteFileFromStorage(`${fallbackId}/${accessType}/${fileName}`);
+  }
+
+  return result;
+};
+
+// Deletes all files for a workspace — cleans up both workspaceId-prefixed (new uploads) and
+// environmentId-prefixed (legacy uploads) paths. Errors are not thrown; callers should check results.
+export const deleteFilesByWorkspaceId = async (workspaceId: string, environmentIds: string[]) => {
+  const results = await Promise.all([
+    deleteFilesByPrefix(workspaceId),
+    ...environmentIds.map((envId) => deleteFilesByPrefix(envId)),
+  ]);
+
+  // Return the first error if any, otherwise success
+  for (const result of results) {
+    if (!result.ok) {
+      return result;
+    }
+  }
+
+  return results[0];
+};
+
+/**
+ * Best-effort storage cleanup for a workspace that has just been deleted.
+ *
+ * Both callers (workspace deletion and organization deletion) run this *after* the database cascade
+ * has committed, so there is nothing left to roll back and no row left pointing at these objects.
+ * A storage failure — S3 unconfigured, bucket unreachable, objects already gone — is therefore
+ * logged and swallowed: reporting the deletion as failed would be a lie, since the records really
+ * are gone. The cost of that choice is orphaned objects when storage is down, which is the same
+ * trade-off `deleteWorkspace` has always made.
+ */
+export const deleteWorkspaceFilesBestEffort = async (workspace: {
+  id: string;
+  legacyEnvironmentId?: string | null;
+}): Promise<void> => {
+  // Pre-#8044 uploads are keyed by the environment id the workspace was migrated from, so both
+  // prefixes have to go. A null id is dropped here and never reaches deleteFilesByPrefix.
+  const legacyPrefixes = [workspace.legacyEnvironmentId].filter((prefix): prefix is string =>
+    Boolean(prefix)
+  );
+
+  try {
+    const result = await deleteFilesByWorkspaceId(workspace.id, legacyPrefixes);
+
+    if (!result.ok) {
+      logger.error({ error: result.error, workspaceId: workspace.id }, "Error deleting stored files");
+    }
+  } catch (error) {
+    logger.error({ error, workspaceId: workspace.id }, "Error deleting stored files");
+  }
+};
+
+/**
+ * Best-effort sweep of a deleted survey's upload folder.
+ *
+ * Since #8044 the client upload route keys every response upload as
+ * `{workspaceId}/private/surveys/{surveyId}/elements/{elementId}/{file}`, so this one prefix reaches
+ * files a scan of `response.data` cannot: answers to an upload element since removed from the survey,
+ * and files a respondent uploaded but never submitted. Pre-#8044 uploads sit flat under
+ * `{prefix}/private/` with no survey in the key, so for those the response scan remains the only way.
+ *
+ * Only for a survey that is already deleted. On a live survey (a response reset) the same sweep would
+ * also take the upload of a respondent who is mid-survey. The prefix is built from the survey's own
+ * row, never from response data, and the trailing slash keeps one survey id from matching another
+ * that starts with it. Like the workspace sweep above, errors are logged and swallowed.
+ */
+export const deleteSurveyUploadFilesBestEffort = async ({
+  workspaceId,
+  surveyId,
+}: {
+  workspaceId: string;
+  surveyId: string;
+}): Promise<void> => {
+  try {
+    const result = await deleteFilesByPrefix(`${workspaceId}/private/surveys/${surveyId}/`);
+
+    if (!result.ok) {
+      logger.error({ error: result.error, workspaceId, surveyId }, "Error deleting a survey's stored files");
+    }
+  } catch (error) {
+    logger.error({ error, workspaceId, surveyId }, "Error deleting a survey's stored files");
+  }
+};

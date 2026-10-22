@@ -1,0 +1,15 @@
+type: object
+required:
+  - id
+  - imageUrl
+properties:
+  id:
+    type: string
+    description: Stable picture choice id.
+  imageUrl:
+    type: string
+  imageAltText:
+    allOf:
+      - $ref: ./TranslatableText.yml
+    description: Text alternative for `imageUrl`, read by screen readers. Omit or leave empty to fall back to the positional label ("Option 1", "Option 2", …); a choice image is never decorative, since the respondent selects it.
+additionalProperties: false

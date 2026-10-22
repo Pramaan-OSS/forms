@@ -1,0 +1,605 @@
+// Add this import for survey-ui CSS variables
+import surveyUiCss from "@forms/survey-ui/styles?inline";
+import {
+  DEFAULT_DARK_BRAND_COLOR,
+  DEFAULT_INPUT_SHADOW,
+  getDarkReadableColors,
+  resolveDarkColors,
+} from "@forms/types/dark-palette";
+import { sanitizeThemeStyling } from "@forms/types/styling-values";
+import { type TSurveyStyling } from "@forms/types/surveys/types";
+import { type TWorkspaceStyling } from "@forms/types/workspace";
+import { ensureReadable, isLight, mixColor } from "@/lib/color";
+import global from "@/styles/global.css?inline";
+import preflight from "@/styles/preflight.css?inline";
+import editorCss from "../../../../apps/web/modules/ui/components/editor/styles-editor-frontend.css?inline";
+
+// Store the nonce globally for style elements
+let styleNonce: string | undefined;
+
+/**
+ * Set the CSP nonce to be applied to all style elements
+ * @param nonce - The CSP nonce value (without 'nonce-' prefix)
+ */
+export const setStyleNonce = (nonce: string | undefined): void => {
+  styleNonce = nonce;
+
+  // Update existing style elements if they exist
+  const existingStyleElement = document.getElementById("forms__css");
+  if (existingStyleElement && nonce) {
+    existingStyleElement.setAttribute("nonce", nonce);
+  }
+
+  const existingCustomStyleElement = document.getElementById("forms__css__custom");
+  if (existingCustomStyleElement && nonce) {
+    existingCustomStyleElement.setAttribute("nonce", nonce);
+  }
+};
+
+export const getStyleNonce = (): string | undefined => {
+  return styleNonce;
+};
+
+export const addStylesToDom = () => {
+  if (document.getElementById("forms__css") === null) {
+    const styleElement = document.createElement("style");
+    styleElement.id = "forms__css";
+
+    // Apply nonce if available
+    if (styleNonce) {
+      styleElement.setAttribute("nonce", styleNonce);
+    }
+
+    // Include survey-ui CSS variables before other styles
+    styleElement.innerHTML = preflight + global + editorCss + surveyUiCss;
+    document.head.appendChild(styleElement);
+  } else {
+    // If style element already exists, update its nonce if needed
+    const existingStyleElement = document.getElementById("forms__css");
+    if (existingStyleElement && styleNonce && !existingStyleElement.getAttribute("nonce")) {
+      existingStyleElement.setAttribute("nonce", styleNonce);
+    }
+  }
+};
+
+/**
+ * The dark palette as a second variable block. The light block above it is left exactly as it
+ * was; appearance switches by flipping `data-appearance` on #fbjs, so both palettes are always in
+ * the stylesheet and no CSS is rebuilt on a switch (ENG-2939, ENG-2940).
+ *
+ * Each color resolves through resolveDarkColors: explicit `.dark` → light value for the brand
+ * colors (D12) → a value derived from the brand color. The `!important` rules further down only
+ * reference these variables, so they pick up the dark values without being duplicated.
+ */
+/**
+ * survey-ui's base tokens (popover, calendar, muted surfaces) follow the dark palette, so a brand or
+ * card override reaches the dropdown and date picker too. Same mapping as the fallback block in
+ * survey-ui globals.css.
+ */
+const getDarkBaseTokens = (dark: ReturnType<typeof resolveDarkColors>): string => {
+  const card = dark.cardBackgroundColor;
+  const text = dark.elementHeadlineColor;
+  const inputBg = dark.inputBgColor;
+  const tokens: [string, string | undefined][] = [
+    ["background", card],
+    ["card", card],
+    ["foreground", text],
+    ["card-foreground", text],
+    ["popover", inputBg],
+    ["popover-foreground", text],
+    ["secondary", inputBg],
+    ["secondary-foreground", text],
+    ["muted", inputBg],
+    ["muted-foreground", text && inputBg ? mixColor(text, inputBg, 0.3) : undefined],
+    ["accent", dark.accentBgColor],
+    ["accent-foreground", text],
+    ["border", dark.inputBorderColor],
+    ["input", text],
+  ];
+  return tokens
+    .filter(([, value]) => value)
+    .map(([name, value]) => `  --${name}: ${value};\n`)
+    .join("");
+};
+
+/**
+ * The brand stays as typed for fills (D12); text, the focus ring and the error red are lightened just
+ * enough to stay readable on this card.
+ */
+const getDarkReadableTokens = (dark: ReturnType<typeof resolveDarkColors>): string => {
+  const card = dark.cardBackgroundColor;
+  if (!card) return "";
+  const readable = getDarkReadableColors(dark.brandColor ?? DEFAULT_DARK_BRAND_COLOR, card);
+  return (
+    `  --fb-brand-readable-color: ${readable.brandTextColor};\n` +
+    `  --fb-focus-ring-outer-color: ${readable.focusRingColor};\n` +
+    `  --destructive: ${readable.errorColor};\n`
+  );
+};
+
+export const getDarkThemeCss = (rawStyling: TWorkspaceStyling | TSurveyStyling): string => {
+  // Stored styling can predate write-time validation: unsafe values fall back as if unset (ENG-2950).
+  const styling = sanitizeThemeStyling(rawStyling);
+  const dark = resolveDarkColors(styling);
+  let css = '#fbjs[data-appearance="dark"] {\n  color-scheme: dark;\n';
+  const add = (variableName: string, value?: string | null) => {
+    if (value !== undefined && value !== null) css += `  --fb-${variableName}: ${value};\n`;
+  };
+
+  const card = dark.cardBackgroundColor;
+  const text = dark.elementHeadlineColor;
+  const inputBg = dark.inputBgColor;
+
+  add("brand-color", dark.brandColor);
+  add("survey-brand-color", dark.brandColor);
+  add("focus-color", dark.brandColor);
+  if (dark.brandColor) add("brand-text-color", isLight(dark.brandColor) ? "black" : "white");
+
+  add("heading-color", text);
+  add("element-headline-color", text);
+  add("element-description-color", dark.elementDescriptionColor);
+  add("subheading-color", dark.elementDescriptionColor);
+  add("label-color", dark.elementUpperLabelColor);
+  add("element-upper-label-color", dark.elementUpperLabelColor);
+  if (text) {
+    add("signature-text-color", mixColor(text, "#000000", 0.2));
+    add("branding-text-color", mixColor(text, "#000000", 0.3));
+  }
+
+  add("survey-background-color", card);
+  add("survey-border-color", dark.cardBorderColor);
+  // Tailwind's default border color (the v3 compatibility rule in global.css). Light gray on a dark
+  // card would outline every default-bordered element, so it follows the dark card border instead.
+  if (dark.cardBorderColor) css += `  --color-gray-200: ${dark.cardBorderColor};\n`;
+  add("card-border-color", dark.cardBorderColor);
+  add("highlight-border-color", dark.highlightBorderColor);
+
+  add("input-color", dark.inputTextColor);
+  add("input-text-color", dark.inputTextColor);
+  if (dark.inputTextColor && inputBg) {
+    // Light mode mixes the placeholder toward white; on a dark field it fades toward the field.
+    const placeholder = mixColor(dark.inputTextColor, inputBg, 0.3);
+    add("placeholder-color", placeholder);
+    add("input-placeholder-color", placeholder);
+  }
+  add("border-color", dark.inputBorderColor);
+  add("input-border-color", dark.inputBorderColor);
+  if (dark.inputBorderColor) add("border-color-highlight", mixColor(dark.inputBorderColor, "#ffffff", 0.1));
+  add("input-background-color", inputBg);
+  add("input-bg-color", inputBg);
+  if (inputBg) {
+    add("input-background-color-selected", mixColor(inputBg, "#ffffff", 0.05));
+    add("hover-bg-color", mixColor(inputBg, "#ffffff", 0.08));
+  }
+  // The light default shadow reads as a dark smudge on a dark field; a shadow the customer set (often an
+  // outline drawn with an inset shadow) is theirs and stays. Written out either way: the dark fallback in
+  // survey-ui globals.css sets `none` with a more specific selector than the light value.
+  const isDefaultShadow = !styling.inputShadow || styling.inputShadow === DEFAULT_INPUT_SHADOW;
+  add("input-shadow", isDefaultShadow ? "none" : styling.inputShadow);
+
+  add("option-bg-color", dark.optionBgColor);
+  add("option-label-color", dark.optionLabelColor);
+  add("option-border-color", dark.optionBorderColor);
+
+  add("accent-background-color", dark.accentBgColor);
+  add("accent-background-color-selected", dark.accentBgColorSelected);
+
+  const buttonBg = dark.buttonBgColor;
+  const buttonText = dark.buttonTextColor ?? (buttonBg && (isLight(buttonBg) ? "#0f172a" : "#ffffff"));
+  add("button-bg-color", buttonBg);
+  add("button-text-color", buttonText);
+  // Same rule as light: the ghost Back button shows the button color as text on the card. Without a
+  // button color it is the brand (or the default brand), which on a dark card is never readable as is.
+  if (card) {
+    add("back-button-color", ensureReadable(buttonBg ?? dark.brandColor ?? DEFAULT_DARK_BRAND_COLOR, card));
+  }
+
+  add("progress-track-bg-color", dark.progressTrackBgColor);
+  add("progress-indicator-bg-color", dark.progressIndicatorBgColor);
+
+  // Hover / selected states lighten a dark surface instead of darkening it (survey-ui tokens).
+  add("shade-color", "white");
+  if (card) add("tint-color", card);
+
+  css += getDarkBaseTokens(dark);
+
+  css += getDarkReadableTokens(dark);
+
+  return `${css}}\n`;
+};
+
+export const addCustomThemeToDom = ({
+  styling: rawStyling,
+}: {
+  styling: TWorkspaceStyling | TSurveyStyling;
+}): void => {
+  // Every styling value below is written into stylesheet text, and stored styling can predate write-time
+  // validation: an unsafe value (one that could add declarations or rules) falls back as if it were
+  // unset, while valid values pass through unchanged (ENG-2950).
+  const styling = sanitizeThemeStyling(rawStyling);
+
+  // Check if the style element already exists
+  let styleElement = document.getElementById("forms__css__custom") as HTMLStyleElement | null;
+
+  // If the style element exists, update nonce if needed
+  if (styleElement) {
+    // Update nonce if it wasn't set before
+    if (styleNonce && !styleElement.getAttribute("nonce")) {
+      styleElement.setAttribute("nonce", styleNonce);
+    }
+  } else {
+    // Create it and append to the head
+    styleElement = document.createElement("style");
+    styleElement.id = "forms__css__custom";
+
+    // Apply nonce if available
+    if (styleNonce) {
+      styleElement.setAttribute("nonce", styleNonce);
+    }
+
+    document.head.appendChild(styleElement);
+  }
+
+  // Start the innerHTML string with #fbjs
+  let cssVariables = "#fbjs {\n";
+
+  // Helper function to append the variable if it's not undefined
+  const appendCssVariable = (variableName: string, value?: string | null) => {
+    if (value !== undefined && value !== null) {
+      cssVariables += `--fb-${variableName}: ${value};\n`;
+    }
+  };
+  // if roundness is defined, even if it's 0, set the border-radius
+  const roundness = styling.roundness ?? 8;
+
+  // Use the helper function to append CSS variables
+  appendCssVariable("brand-color", styling.brandColor?.light);
+  appendCssVariable("survey-brand-color", styling.brandColor?.light);
+  appendCssVariable("focus-color", styling.brandColor?.light);
+  if (styling.brandColor?.light) {
+    // If the brand color is defined, set the text color based on the lightness of the brand color
+    appendCssVariable("brand-text-color", isLight(styling.brandColor.light) ? "black" : "white");
+  } else {
+    // If the brand color is undefined, default to white
+    appendCssVariable("brand-text-color", "#ffffff");
+  }
+
+  appendCssVariable("heading-color", styling.elementHeadlineColor?.light);
+  appendCssVariable("element-headline-color", styling.elementHeadlineColor?.light);
+  appendCssVariable("element-description-color", styling.elementDescriptionColor?.light);
+  appendCssVariable("input-color", styling.inputTextColor?.light);
+  appendCssVariable("label-color", styling.elementUpperLabelColor?.light);
+  appendCssVariable("subheading-color", styling.elementDescriptionColor?.light);
+
+  const placeholderBaseColor = styling.inputTextColor?.light;
+  if (placeholderBaseColor) {
+    appendCssVariable("placeholder-color", mixColor(placeholderBaseColor, "#ffffff", 0.3));
+    appendCssVariable("input-placeholder-color", mixColor(placeholderBaseColor, "#ffffff", 0.3));
+  }
+
+  appendCssVariable("border-color", styling.inputBorderColor?.light);
+
+  if (styling.inputBorderColor?.light) {
+    appendCssVariable("border-color-highlight", mixColor(styling.inputBorderColor.light, "#000000", 0.1));
+    appendCssVariable("input-border-color", styling.inputBorderColor?.light);
+  }
+
+  // helper function to format dimensions
+  const formatDimension = (value: string | number | null | undefined) => {
+    if (value === null || value === undefined) return undefined;
+    if (typeof value === "number") {
+      return `${value}px`;
+    }
+    if (typeof value === "string" && !Number.isNaN(Number(value))) {
+      return `${value}px`;
+    }
+    return value;
+  };
+
+  appendCssVariable("survey-background-color", styling.cardBackgroundColor?.light);
+  appendCssVariable("survey-border-color", styling.cardBorderColor?.light);
+  appendCssVariable("border-radius", formatDimension(roundness));
+  appendCssVariable("input-border-radius", formatDimension(roundness));
+  appendCssVariable("option-border-radius", formatDimension(roundness));
+  appendCssVariable("button-border-radius", formatDimension(roundness));
+  appendCssVariable("input-background-color", styling.inputBgColor?.light);
+  appendCssVariable("input-bg-color", styling.inputBgColor?.light);
+  appendCssVariable("option-bg-color", styling.optionBgColor?.light);
+  appendCssVariable("input-color", styling.inputTextColor?.light);
+
+  if (styling.elementHeadlineColor?.light) {
+    const isLightHeadlineColor = isLight(styling.elementHeadlineColor.light);
+    const signatureColor = mixColor(
+      styling.elementHeadlineColor.light,
+      isLightHeadlineColor ? "#000000" : "#ffffff",
+      0.2
+    );
+    const brandingColor = mixColor(
+      styling.elementHeadlineColor.light,
+      isLightHeadlineColor ? "#000000" : "#ffffff",
+      0.3
+    );
+
+    appendCssVariable("signature-text-color", signatureColor);
+    appendCssVariable("branding-text-color", brandingColor);
+  }
+
+  if (styling.inputBgColor?.light) {
+    if (
+      styling.inputBgColor.light === "#fff" ||
+      styling.inputBgColor.light === "#ffffff" ||
+      styling.inputBgColor.light === "white"
+    ) {
+      appendCssVariable("input-background-color-selected", "var(--slate-50)");
+    } else {
+      appendCssVariable(
+        "input-background-color-selected",
+        mixColor(styling.inputBgColor.light, "#000000", 0.025)
+      );
+    }
+  }
+
+  if (styling.brandColor?.light) {
+    const brandColor = styling.brandColor.light;
+
+    const accentColor = mixColor(brandColor, "#ffffff", 0.8);
+    const accentColorSelected = mixColor(brandColor, "#ffffff", 0.7);
+
+    appendCssVariable("accent-background-color", accentColor);
+    appendCssVariable("accent-background-color-selected", accentColorSelected);
+
+    if (isLight(brandColor)) {
+      appendCssVariable("calendar-tile-color", mixColor(brandColor, "#000000", 0.7));
+    }
+  }
+
+  // Buttons (Advanced)
+  const buttonBg = styling.buttonBgColor?.light;
+  let buttonText = styling.buttonTextColor?.light;
+  if (buttonText === undefined && buttonBg) {
+    buttonText = isLight(buttonBg) ? "#0f172a" : "#ffffff";
+  }
+  appendCssVariable("button-bg-color", buttonBg);
+  appendCssVariable("button-text-color", buttonText);
+  // The ghost "Back" button renders the brand (button bg) as text directly on the card surface,
+  // where a light brand fails contrast. Darken it toward readable while keeping the brand hue.
+  if (buttonBg) {
+    const backButtonSurface = styling.cardBackgroundColor?.light ?? "#ffffff";
+    appendCssVariable("back-button-color", ensureReadable(buttonBg, backButtonSurface));
+  }
+  if (styling.buttonBorderRadius !== undefined)
+    appendCssVariable("button-border-radius", formatDimension(styling.buttonBorderRadius));
+  if (styling.buttonHeight !== undefined)
+    appendCssVariable("button-height", formatDimension(styling.buttonHeight));
+  if (styling.buttonFontSize !== undefined)
+    appendCssVariable("button-font-size", formatDimension(styling.buttonFontSize));
+  if (styling.buttonFontWeight !== undefined && styling.buttonFontWeight !== null)
+    appendCssVariable("button-font-weight", `${styling.buttonFontWeight}`);
+  if (styling.buttonPaddingX !== undefined)
+    appendCssVariable("button-padding-x", formatDimension(styling.buttonPaddingX));
+  if (styling.buttonPaddingY !== undefined)
+    appendCssVariable("button-padding-y", formatDimension(styling.buttonPaddingY));
+
+  // Inputs (Advanced)
+  appendCssVariable("input-background-color", styling.inputBgColor?.light);
+  const inputTextColor = styling.inputTextColor?.light;
+  appendCssVariable("input-text-color", inputTextColor);
+  if (inputTextColor) {
+    appendCssVariable("input-placeholder-color", mixColor(inputTextColor, "#ffffff", 0.3));
+  }
+  if (styling.inputBorderRadius !== undefined)
+    appendCssVariable("input-border-radius", formatDimension(styling.inputBorderRadius));
+  if (styling.inputHeight !== undefined)
+    appendCssVariable("input-height", formatDimension(styling.inputHeight));
+  if (styling.inputFontSize !== undefined)
+    appendCssVariable("input-font-size", formatDimension(styling.inputFontSize));
+  if (styling.inputPaddingX !== undefined)
+    appendCssVariable("input-padding-x", formatDimension(styling.inputPaddingX));
+  if (styling.inputPaddingY !== undefined)
+    appendCssVariable("input-padding-y", formatDimension(styling.inputPaddingY));
+  if (styling.inputPlaceholderOpacity !== undefined)
+    appendCssVariable("input-placeholder-opacity", `${styling.inputPlaceholderOpacity}`);
+  appendCssVariable("input-shadow", styling.inputShadow);
+
+  // Options (Advanced)
+  appendCssVariable("option-bg-color", styling.optionBgColor?.light);
+  appendCssVariable("option-label-color", styling.optionLabelColor?.light);
+  if (styling.optionBorderColor?.light)
+    appendCssVariable("option-border-color", styling.optionBorderColor.light);
+  if (styling.optionBorderRadius !== undefined)
+    appendCssVariable("option-border-radius", formatDimension(styling.optionBorderRadius));
+  if (styling.optionPaddingX !== undefined)
+    appendCssVariable("option-padding-x", formatDimension(styling.optionPaddingX));
+  if (styling.optionPaddingY !== undefined)
+    appendCssVariable("option-padding-y", formatDimension(styling.optionPaddingY));
+  if (styling.optionFontSize !== undefined)
+    appendCssVariable("option-font-size", formatDimension(styling.optionFontSize));
+
+  // Element Headline & Description (Advanced)
+  if (styling.elementHeadlineFontSize !== undefined)
+    appendCssVariable("element-headline-font-size", formatDimension(styling.elementHeadlineFontSize));
+  if (styling.elementHeadlineFontWeight !== undefined && styling.elementHeadlineFontWeight !== null)
+    appendCssVariable("element-headline-font-weight", `${styling.elementHeadlineFontWeight}`);
+  appendCssVariable("element-headline-color", styling.elementHeadlineColor?.light);
+
+  if (styling.elementDescriptionFontSize !== undefined)
+    appendCssVariable("element-description-font-size", formatDimension(styling.elementDescriptionFontSize));
+  if (styling.elementDescriptionFontWeight !== undefined && styling.elementDescriptionFontWeight !== null)
+    appendCssVariable("element-description-font-weight", `${styling.elementDescriptionFontWeight}`);
+  appendCssVariable("element-description-color", styling.elementDescriptionColor?.light);
+
+  appendCssVariable(
+    "element-upper-label-font-size",
+    formatDimension(styling.elementUpperLabelFontSize ?? 12)
+  );
+  appendCssVariable("element-upper-label-color", styling.elementUpperLabelColor?.light);
+
+  if (styling.elementUpperLabelColor?.light) {
+    appendCssVariable("element-upper-label-opacity", "1");
+  }
+
+  appendCssVariable("element-upper-label-font-weight", `${styling.elementUpperLabelFontWeight ?? "normal"}`);
+
+  // Progress Bar (Advanced)
+  if (styling.progressTrackHeight !== undefined)
+    appendCssVariable("progress-track-height", formatDimension(styling.progressTrackHeight));
+
+  // Implicitly set the progress track border radius to the roundness of the card
+  appendCssVariable("progress-track-border-radius", formatDimension(roundness));
+
+  appendCssVariable("progress-track-bg-color", styling.progressTrackBgColor?.light);
+  appendCssVariable("progress-indicator-bg-color", styling.progressIndicatorBgColor?.light);
+
+  // Close the #fbjs variable block
+  cssVariables += "}\n";
+
+  // ---------------------------------------------------------------------------
+  // Conditional !important overrides
+  //
+  // Only emit rules for properties the user has *explicitly* set.  This ensures
+  // the Tailwind baseline classes are used when no custom value is provided,
+  // and prevents the brand-color change from cascading into unrelated elements
+  // (e.g. button bg, headline color) unless the user opted in.
+  // ---------------------------------------------------------------------------
+
+  const addRule = (selector: string, declarations: string) => {
+    if (declarations.trim()) {
+      cssVariables += `${selector} {\n${declarations}}\n`;
+    }
+  };
+
+  // Formatted text inside the headline and description hooks inherits these from the hook element, as in
+  // survey-ui's globals.css, so Custom CSS on the hook reaches it. Same specificity as the `.label-* *`
+  // rule it follows, so it wins by order while the bold rule (`.label-headline strong`) still wins.
+  const toInherited = (declarations: string) =>
+    declarations.replaceAll(/: var\([^)]*\) !important;/g, ": inherit !important;");
+
+  // --- Headlines ---
+  let headlineDecls = "";
+  if (styling.elementHeadlineFontSize !== undefined)
+    headlineDecls += "  font-size: var(--fb-element-headline-font-size) !important;\n";
+  if (styling.elementHeadlineFontWeight !== undefined && styling.elementHeadlineFontWeight !== null)
+    headlineDecls += "  font-weight: var(--fb-element-headline-font-weight) !important;\n";
+  if (styling.elementHeadlineColor?.light)
+    headlineDecls += "  color: var(--fb-element-headline-color) !important;\n";
+  addRule("#fbjs .label-headline,\n#fbjs .label-headline *", headlineDecls);
+  addRule('#fbjs [data-fb-part="headline"] *', toInherited(headlineDecls));
+
+  // --- Descriptions ---
+  let descriptionDecls = "";
+  if (styling.elementDescriptionFontSize !== undefined)
+    descriptionDecls += "  font-size: var(--fb-element-description-font-size) !important;\n";
+  if (styling.elementDescriptionFontWeight !== undefined && styling.elementDescriptionFontWeight !== null)
+    descriptionDecls += "  font-weight: var(--fb-element-description-font-weight) !important;\n";
+  if (styling.elementDescriptionColor?.light)
+    descriptionDecls += "  color: var(--fb-element-description-color) !important;\n";
+  addRule("#fbjs .label-description,\n#fbjs .label-description *", descriptionDecls);
+  addRule('#fbjs [data-fb-part="description"] *', toInherited(descriptionDecls));
+
+  // --- Upper labels ---
+  let upperDecls = "";
+  if (styling.elementUpperLabelFontSize !== undefined)
+    upperDecls += "  font-size: var(--fb-element-upper-label-font-size) !important;\n";
+  if (styling.elementUpperLabelFontWeight !== undefined && styling.elementUpperLabelFontWeight !== null)
+    upperDecls += "  font-weight: var(--fb-element-upper-label-font-weight) !important;\n";
+  if (styling.elementUpperLabelColor?.light) {
+    upperDecls += "  color: var(--fb-element-upper-label-color) !important;\n";
+    upperDecls += "  opacity: var(--fb-element-upper-label-opacity, 1) !important;\n";
+  }
+  addRule("#fbjs .label-card,\n#fbjs .label-card *", upperDecls);
+
+  // --- Buttons ---
+  let buttonDecls = "";
+  if (buttonBg) buttonDecls += "  background-color: var(--fb-button-bg-color) !important;\n";
+  if (buttonText) buttonDecls += "  color: var(--fb-button-text-color) !important;\n";
+  if (styling.buttonBorderRadius !== undefined)
+    buttonDecls += "  border-radius: var(--fb-button-border-radius) !important;\n";
+  if (styling.buttonHeight !== undefined) buttonDecls += "  height: var(--fb-button-height) !important;\n";
+  if (styling.buttonFontSize !== undefined)
+    buttonDecls += "  font-size: var(--fb-button-font-size) !important;\n";
+  if (styling.buttonFontWeight !== undefined && styling.buttonFontWeight !== null)
+    buttonDecls += "  font-weight: var(--fb-button-font-weight) !important;\n";
+  if (styling.buttonPaddingX !== undefined) {
+    buttonDecls += "  padding-left: var(--fb-button-padding-x) !important;\n";
+    buttonDecls += "  padding-right: var(--fb-button-padding-x) !important;\n";
+  }
+  if (styling.buttonPaddingY !== undefined) {
+    buttonDecls += "  padding-top: var(--fb-button-padding-y) !important;\n";
+    buttonDecls += "  padding-bottom: var(--fb-button-padding-y) !important;\n";
+  }
+  addRule("#fbjs .button-custom,\n#fbjs button.button-custom", buttonDecls);
+
+  // --- Options ---
+  if (styling.optionBorderRadius !== undefined)
+    addRule("#fbjs .rounded-option", "  border-radius: var(--fb-option-border-radius) !important;\n");
+  if (styling.optionBorderColor?.light)
+    addRule("#fbjs .border-option-border", "  border-color: var(--fb-option-border-color) !important;\n");
+  if (styling.optionBgColor?.light)
+    addRule("#fbjs .bg-option-bg", "  background-color: var(--fb-option-bg-color) !important;\n");
+
+  let optionLabelDecls = "";
+  if (styling.optionLabelColor?.light)
+    optionLabelDecls += "  color: var(--fb-option-label-color) !important;\n";
+  if (styling.optionFontSize !== undefined)
+    optionLabelDecls += "  font-size: var(--fb-option-font-size) !important;\n";
+  addRule("#fbjs .text-option-label", optionLabelDecls);
+
+  if (styling.optionPaddingX !== undefined)
+    addRule(
+      "#fbjs .px-option-x",
+      "  padding-left: var(--fb-option-padding-x) !important;\n  padding-right: var(--fb-option-padding-x) !important;\n"
+    );
+  if (styling.optionPaddingY !== undefined)
+    addRule(
+      "#fbjs .py-option-y",
+      "  padding-top: var(--fb-option-padding-y) !important;\n  padding-bottom: var(--fb-option-padding-y) !important;\n"
+    );
+
+  // --- Inputs ---
+  if (styling.inputBorderRadius !== undefined)
+    addRule("#fbjs .rounded-input", "  border-radius: var(--fb-input-border-radius) !important;\n");
+  if (styling.inputBgColor?.light)
+    addRule("#fbjs .bg-input-bg", "  background-color: var(--fb-input-background-color) !important;\n");
+  if (styling.inputBorderColor?.light)
+    addRule("#fbjs .border-input-border", "  border-color: var(--fb-input-border-color) !important;\n");
+
+  let inputTextDecls = "";
+  if (styling.inputTextColor?.light) inputTextDecls += "  color: var(--fb-input-text-color) !important;\n";
+  if (styling.inputFontSize !== undefined)
+    inputTextDecls += "  font-size: var(--fb-input-font-size) !important;\n";
+  addRule("#fbjs .text-input-text", inputTextDecls);
+
+  if (styling.inputPaddingX !== undefined)
+    addRule(
+      "#fbjs .px-input-x",
+      "  padding-left: var(--fb-input-padding-x) !important;\n  padding-right: var(--fb-input-padding-x) !important;\n"
+    );
+  if (styling.inputPaddingY !== undefined)
+    addRule(
+      "#fbjs .py-input-y",
+      "  padding-top: var(--fb-input-padding-y) !important;\n  padding-bottom: var(--fb-input-padding-y) !important;\n"
+    );
+
+  // --- Progress bar ---
+  if (styling.progressTrackHeight !== undefined) {
+    addRule(
+      "html body #fbjs div.progress-track",
+      "  border-radius: var(--fb-progress-track-border-radius) var(--fb-progress-track-border-radius) 0 0 !important;\n" +
+        "  height: var(--fb-progress-track-height) !important;\n" +
+        "  min-height: var(--fb-progress-track-height) !important;\n" +
+        "  max-height: none !important;\n" +
+        "  overflow: hidden !important;\n"
+    );
+    addRule(
+      "html body #fbjs div.progress-indicator",
+      "  height: 100% !important;\n  border-radius: 0 !important;\n"
+    );
+  }
+
+  addRule("html body #fbjs .cardless-progress-bar div.progress-track", "  border-radius: 0 !important;\n");
+
+  cssVariables += getDarkThemeCss(styling);
+
+  // Set the innerHTML of the style element
+  styleElement.innerHTML = cssVariables;
+};

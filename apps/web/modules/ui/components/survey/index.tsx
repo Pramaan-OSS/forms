@@ -1,0 +1,96 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SurveyContainerProps } from "@forms/types/forms-surveys";
+import { IS_DEVELOPMENT_BUILD } from "@/lib/env-client";
+import { executeRecaptcha, loadRecaptchaScript } from "@/modules/ui/components/survey/recaptcha";
+
+const createContainerId = () => `forms-survey-container`;
+
+// Module-level flag to prevent concurrent script loads across component instances
+let isLoadingScript = false;
+
+// `window.formsSurveys` is typed once, in packages/types/surveys.d.ts. A second declaration here
+// had drifted from it (no `setAppearance`), which TypeScript rejects as a conflicting redeclaration.
+
+export const SurveyInline = (props: Omit<SurveyContainerProps, "containerId">) => {
+  const containerId = useMemo(() => createContainerId(), []);
+  const getRecaptchaToken = useCallback(
+    () => executeRecaptcha(props.recaptchaSiteKey),
+    [props.recaptchaSiteKey]
+  );
+
+  const renderInline = useCallback(
+    () =>
+      window.formsSurveys.renderSurvey({
+        ...props,
+        // A preview refresh must not move focus out of the editor or its open dialogs.
+        autoFocus: props.isPreviewMode ? false : props.autoFocus,
+        containerId,
+        getRecaptchaToken,
+        mode: "inline",
+      }),
+    [containerId, props, getRecaptchaToken]
+  );
+  const [isScriptLoaded, setIsScriptLoaded] = useState(false);
+  const hasLoadedRef = useRef(false);
+
+  const loadSurveyScript: () => Promise<void> = async () => {
+    // Set loading flag immediately to prevent concurrent loads
+    isLoadingScript = true;
+    try {
+      const scriptUrl = props.appUrl ? `${props.appUrl}/js/surveys.umd.cjs` : "/js/surveys.umd.cjs";
+      const response = await fetch(scriptUrl, IS_DEVELOPMENT_BUILD ? { cache: "no-store" } : {});
+
+      if (!response.ok) {
+        throw new Error("Failed to load the surveys package");
+      }
+
+      const scriptContent = await response.text();
+      const scriptElement = document.createElement("script");
+
+      scriptElement.textContent = scriptContent;
+
+      document.head.appendChild(scriptElement);
+      setIsScriptLoaded(true);
+      hasLoadedRef.current = true;
+    } catch (error) {
+      throw error;
+    } finally {
+      isLoadingScript = false;
+    }
+  };
+
+  useEffect(() => {
+    // Prevent duplicate loads across multiple renders or component instances
+    if (hasLoadedRef.current || isLoadingScript) {
+      return;
+    }
+
+    const loadScript = async () => {
+      if (!window.formsSurveys) {
+        try {
+          if (props.isSpamProtectionEnabled && props.recaptchaSiteKey) {
+            await loadRecaptchaScript(props.recaptchaSiteKey);
+          }
+          await loadSurveyScript();
+        } catch (error) {
+          console.error("Failed to load the surveys package: ", error);
+        }
+      } else {
+        renderInline();
+      }
+    };
+
+    loadScript();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-time script load guarded by hasLoadedRef; depending on loadSurveyScript/renderInline would re-trigger the load
+  }, [props]);
+
+  useEffect(() => {
+    if (isScriptLoaded) {
+      renderInline();
+    }
+  }, [isScriptLoaded, renderInline]);
+
+  return <div id={containerId} className="h-full w-full" />;
+};

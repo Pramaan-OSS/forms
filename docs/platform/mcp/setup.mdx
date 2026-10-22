@@ -1,0 +1,21 @@
+---
+title: Connect a client
+---
+
+Connect a compatible MCP client to `https://your-forms-host/api/mcp` using OAuth.
+Sign in to Forms and approve the requested access. Each user has their own connection.
+Local clients may use an HTTP loopback callback on localhost, 127.0.0.1 or [::1].
+
+For a hosted client, the operator must configure its documented, exact HTTPS callback in
+`MCP_DCR_ALLOWED_REDIRECT_URIS` (a JSON array). No hosted callbacks are enabled by default.
+Use a public HTTPS Forms address reachable by that client. Never allow an untrusted callback.
+The registration gate matches the whole address, including path and query; no wildcards.
+Logout callbacks remain loopback-only.
+
+If scopes change, remove the old connection and connect again. The client re-registers
+with the scopes the server advertises (`surveys:read`, `surveys:write`, `workflows:read`,
+    `workflows:write`, `feedbackRecords:read`, `feedbackRecords:write`, `responses:read`,
+    `responses:write`, `offline_access`). The client must request scopes it registered.
+
+If connection fails, check that the MCP address is reachable, the callback is configured
+exactly, and the signed-in user can access the workspace. Do not share access tokens or cookies.

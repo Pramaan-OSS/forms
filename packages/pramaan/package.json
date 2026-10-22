@@ -1,0 +1,34 @@
+{
+  "name": "@forms/pramaan",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0",
+  "exports": {
+    ".": "./src/index.ts",
+    "./managed-runtime": "./src/managed-runtime.ts",
+    "./fake": "./src/fake.ts",
+    "./schemas": "./src/schemas.ts"
+  },
+  "scripts": {
+    "clean": "rimraf .turbo node_modules coverage",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@forms/config-eslint": "workspace:*",
+    "@forms/config-typescript": "workspace:*",
+    "@types/node": "catalog:",
+    "@vitest/coverage-v8": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@pramaan/sdk": "0.1.0"
+  }
+}

@@ -1,0 +1,46 @@
+"use client";
+
+import { RefreshCwIcon } from "lucide-react";
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { registerStaleServerActionListener } from "@/lib/utils/stale-server-action";
+import { Button } from "@/modules/ui/components/button";
+
+/** Whether this tab has outlived the deployment it was served by (latched until reload). */
+export const useIsStaleDeployment = (): boolean => {
+  const [isStale, setIsStale] = useState(false);
+
+  useEffect(() => registerStaleServerActionListener(() => setIsStale(true)), []);
+
+  return isStale;
+};
+
+/**
+ * Prompts the user to reload once their tab has outlived the deployment it was served by.
+ *
+ * Rendered by `ServerActionNotices`, which decides when it shows and positions it: a stale bundle can
+ * invoke a server action from any route. Reloading is offered rather than done automatically -- the
+ * survey editor is the surface this fires on most, and a silent reload there would discard unsaved
+ * edits.
+ */
+export const StaleDeploymentPrompt = () => {
+  const { t } = useTranslation();
+
+  return (
+    // No role="alert": `ServerActionNotices` renders this inside its live region, which announces it.
+    <div className="pointer-events-auto w-full max-w-sm rounded-lg border border-slate-200 bg-white p-4 shadow-lg">
+      <div className="flex gap-3">
+        <RefreshCwIcon className="mt-0.5 size-5 shrink-0 text-slate-500" aria-hidden="true" />
+        <div className="flex flex-col items-start gap-3">
+          <div>
+            <p className="text-sm font-medium text-slate-900">{t("common.app_updated_title")}</p>
+            <p className="mt-1 text-sm text-slate-500">{t("common.app_updated_description")}</p>
+          </div>
+          <Button size="sm" onClick={() => window.location.reload()}>
+            {t("common.reload_page")}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+};

@@ -1,0 +1,427 @@
+{
+  "$schema": "https://turborepo.org/schema.json",
+  "cacheMaxSize": "10GB",
+  "globalDependencies": [
+    ".nvmrc",
+    "authzed/schema.zed",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "prisma.config.mjs",
+    "turbo.json"
+  ],
+  "globalEnv": [
+    "FORMS_STORAGE_BUCKET",
+    "MIGRATE_DATABASE_URL",
+    "PRAMAAN_API_KEY",
+    "PRAMAAN_BASE_URL",
+    "PRAMAAN_SOCIAL_SIGN_IN",
+    "PRAMAAN_BOT_CHECK_WIDGET",
+    "SHADOW_DATABASE_URL",
+    "FORMS_STORAGE_DRIVER",
+    "FORMS_UPLOAD_DIR",
+    "WEBAPP_URL",
+    "PRAMAAN_FAKE",
+    "PRAMAAN_ENTERPRISE_SIGN_IN"
+  ],
+  "globalPassThroughEnv": ["SEED_API_KEY"],
+  "tasks": {
+    "//#test:root": {
+      "cache": false,
+      "outputs": []
+    },
+    "@forms/ai#build": {
+      "dependsOn": ["@forms/logger#build"],
+      "outputs": ["dist/**"]
+    },
+    "@forms/ai#lint": {
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/ai#test": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/ai#test:coverage": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/ai#typecheck": {
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/cache#build": {
+      "dependsOn": ["@forms/logger#build", "^build"],
+      "outputs": ["dist/**"]
+    },
+    "@forms/cache#go": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build"],
+      "persistent": true
+    },
+    "@forms/cache#lint": {
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/cache#test": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/cache#test:coverage": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/cache#typecheck": {
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/database#build": {
+      "dependsOn": ["^build", "@forms/database#generate"],
+      "env": ["DATABASE_URL"],
+      "outputs": ["dist/**", "generated/prisma/**"]
+    },
+    "@forms/database#db:migrate:dev": {
+      "cache": false,
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@forms/database#db:start": {
+      "cache": false,
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "@forms/database#generate": {
+      "dependsOn": ["^generate"],
+      "env": ["DATABASE_URL"],
+      "outputs": ["generated/prisma/**"]
+    },
+    "@forms/database#lint": {
+      "dependsOn": ["@forms/logger#build", "@forms/database#build"]
+    },
+    "@forms/database#test": {
+      "cache": false,
+      "dependsOn": ["@forms/i18n-utils#build"],
+      "env": ["ONLINE_UPGRADE_TEST_DATABASE_URL"]
+    },
+    "@forms/database#test:coverage": {
+      "cache": false,
+      "dependsOn": ["@forms/i18n-utils#build"],
+      "env": ["ONLINE_UPGRADE_TEST_DATABASE_URL"]
+    },
+    "@forms/database#typecheck": {
+      "dependsOn": ["@forms/logger#build", "@forms/database#build"]
+    },
+    "@forms/i18n-utils#build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"]
+    },
+    "@forms/i18n-utils#lint": {
+      "dependsOn": ["^lint"]
+    },
+    "@forms/i18n-utils#test": {
+      "cache": false,
+      "dependsOn": ["@forms/i18n-utils#build"]
+    },
+    "@forms/jobs#build": {
+      "dependsOn": ["@forms/logger#build"],
+      "outputs": ["dist/**"]
+    },
+    "@forms/jobs#lint": {
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/jobs#test": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build"],
+      "env": ["ONLINE_UPGRADE_TEST_REDIS_URL"]
+    },
+    "@forms/jobs#test:coverage": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build"],
+      "env": ["ONLINE_UPGRADE_TEST_REDIS_URL"]
+    },
+    "@forms/jobs#typecheck": {
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/js-core#build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", "$TURBO_ROOT$/apps/web/public/js/forms.*"]
+    },
+    "@forms/js-core#go": {
+      "cache": false,
+      "dependsOn": ["@forms/database#db:setup"],
+      "persistent": true
+    },
+    "@forms/logger#build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"]
+    },
+    "@forms/storage#build": {
+      "dependsOn": ["@forms/logger#build"],
+      "outputs": ["dist/**"]
+    },
+    "@forms/storage#go": {
+      "cache": false,
+      "dependsOn": ["@forms/storage#build"],
+      "persistent": true
+    },
+    "@forms/storage#lint": {
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/storage#test": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/storage#test:coverage": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/storage#typecheck": {
+      "dependsOn": ["@forms/logger#build"]
+    },
+    "@forms/survey-ui#build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"]
+    },
+    "@forms/survey-ui#build:dev": {
+      "dependsOn": ["^build:dev"],
+      "outputs": ["dist/**"]
+    },
+    "@forms/survey-ui#go": {
+      "cache": false,
+      "dependsOn": ["@forms/survey-ui#build"],
+      "persistent": true
+    },
+    "@forms/surveys#build": {
+      "dependsOn": ["^build", "@forms/survey-ui#build"],
+      "outputs": [
+        "dist/**",
+        "$TURBO_ROOT$/apps/web/public/js/surveys.*",
+        "$TURBO_ROOT$/apps/web/public/js/validation.*",
+        "$TURBO_ROOT$/apps/web/public/js/locales/**"
+      ]
+    },
+    "@forms/surveys#build:dev": {
+      "dependsOn": ["^build:dev", "@forms/i18n-utils#build", "@forms/survey-ui#build:dev"],
+      "outputs": ["dist/**"]
+    },
+    "@forms/surveys#go": {
+      "cache": false,
+      "dependsOn": ["@forms/survey-ui#build", "@forms/surveys#build"],
+      "persistent": true
+    },
+    "@forms/surveys#test": {
+      "cache": false,
+      "dependsOn": ["@forms/i18n-utils#build", "@forms/survey-ui#build"]
+    },
+    "@forms/surveys#test:coverage": {
+      "cache": false,
+      "dependsOn": ["@forms/i18n-utils#build", "@forms/survey-ui#build"]
+    },
+    "@forms/surveys#typecheck": {
+      "dependsOn": ["@forms/i18n-utils#build", "@forms/survey-ui#build"]
+    },
+    "@forms/web#dev": {
+      "cache": false,
+      "dependsOn": [
+        "@forms/ai#build",
+        "@forms/cache#build",
+        "@forms/database#build",
+        "@forms/jobs#build",
+        "@forms/logger#build",
+        "@forms/storage#build"
+      ],
+      "persistent": true
+    },
+    "@forms/web#go": {
+      "cache": false,
+      "dependsOn": [
+        "@forms/ai#build",
+        "@forms/cache#build",
+        "@forms/database#build",
+        "@forms/database#db:setup",
+        "@forms/jobs#build",
+        "@forms/logger#build",
+        "@forms/storage#build"
+      ],
+      "persistent": true
+    },
+    "@forms/web#test": {
+      "cache": false,
+      "dependsOn": [
+        "@forms/ai#build",
+        "@forms/logger#build",
+        "@forms/database#build",
+        "@forms/storage#build",
+        "@forms/cache#build",
+        "@forms/jobs#build",
+        "@forms/surveys#build"
+      ]
+    },
+    "@forms/web#test:coverage": {
+      "cache": false,
+      "dependsOn": [
+        "@forms/ai#build",
+        "@forms/logger#build",
+        "@forms/database#build",
+        "@forms/storage#build",
+        "@forms/cache#build",
+        "@forms/jobs#build",
+        "@forms/surveys#build"
+      ]
+    },
+    "@forms/web#typecheck": {
+      "dependsOn": [
+        "@forms/ai#build",
+        "@forms/api-v3-schemas#typecheck",
+        "@forms/cache#build",
+        "@forms/database#build",
+        "@forms/jobs#build",
+        "@forms/logger#build",
+        "@forms/storage#build",
+        "@forms/surveys#build"
+      ]
+    },
+    "@forms/workflows#build": {
+      "outputs": ["dist/**"]
+    },
+    "@forms/workflows#lint": {
+      "dependsOn": []
+    },
+    "@forms/workflows#test": {
+      "cache": false,
+      "dependsOn": []
+    },
+    "@forms/workflows#test:coverage": {
+      "cache": false,
+      "dependsOn": []
+    },
+    "@forms/workflows#typecheck": {
+      "dependsOn": []
+    },
+    "build": {
+      "dependsOn": ["^build"],
+      "env": ["NODE_ENV"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "!**/*.test.*",
+        "!**/*.spec.*",
+        "!**/__tests__/**",
+        "!**/vitest.config.*",
+        "!**/vitest.integration.config.*",
+        "!**/playwright/**"
+      ],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**", "!.next/dev/**"],
+      "passThroughEnv": [
+        "AUTHZED_CONSISTENCY",
+        "AUTHZED_ENABLED",
+        "AUTHZED_ENDPOINT",
+        "AUTHZED_INSECURE",
+        "AUTHZED_SYSTEM_KEY",
+        "AUTHZED_TOKEN",
+        "DATABASE_URL",
+        "DEBUG",
+        "ENCRYPTION_KEY",
+        "ENVIRONMENT",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "LOG_LEVEL",
+        "NEXT_PHASE",
+        "NEXT_RUNTIME",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_LOGS_ENABLED",
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "OTEL_SERVICE_NAME",
+        "OTEL_TRACES_SAMPLER",
+        "OTEL_TRACES_SAMPLER_ARG",
+        "MCP_DCR_ALLOWED_REDIRECT_URIS",
+        "MCP_OAUTH_JWKS_URL",
+        "PROMETHEUS_ENABLED",
+        "PROMETHEUS_EXPORTER_PORT",
+        "REDIS_URL",
+        "SURVEY_VISIBILITY_FORCE_DISABLED",
+        "FORMS_UPGRADE_MODE",
+        "SURVEY_WORKSPACE_LIMIT",
+        "VERSION",
+        "npm_package_version"
+      ]
+    },
+    "build:dev": {
+      "dependsOn": ["^build:dev"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**", "!.next/dev/**"]
+    },
+    "clean": {
+      "cache": false,
+      "outputs": []
+    },
+    "db:down": {
+      "cache": false,
+      "outputs": []
+    },
+    "db:migrate:deploy": {
+      "cache": false,
+      "outputs": []
+    },
+    "db:migrate:dev": {
+      "cache": false,
+      "outputs": []
+    },
+    "db:push": {
+      "cache": false,
+      "outputs": []
+    },
+    "db:seed": {
+      "cache": false,
+      "env": ["ALLOW_SEED", "DATABASE_URL"],
+      "outputs": []
+    },
+    "db:setup": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build", "@forms/database#build"],
+      "outputs": []
+    },
+    "db:start": {
+      "cache": false
+    },
+    "db:up": {
+      "cache": false,
+      "outputs": []
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "generate": {
+      "dependsOn": ["^generate"],
+      "outputs": ["generated/prisma/**"]
+    },
+    "go": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "outputs": []
+    },
+    "start": {
+      "outputs": []
+    },
+    "storybook": {
+      "cache": false,
+      "persistent": true
+    },
+    "storybook#storybook": {
+      "cache": false,
+      "dependsOn": ["@forms/logger#build"],
+      "persistent": true
+    },
+    "test": {
+      "cache": false,
+      "outputs": []
+    },
+    "test:coverage": {
+      "cache": false,
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": ["@forms/database#generate", "^typecheck"],
+      "outputs": []
+    }
+  },
+  "ui": "stream"
+}

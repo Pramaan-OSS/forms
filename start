@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+usage() { echo 'Usage: ./start [--development | --production]'; }
+[ "$#" -le 1 ] || { usage; exit 2; }
+case "${1:-}" in
+  ''|--production) FORMS_START_MODE=production ;;
+  --development) FORMS_START_MODE=development ;;
+  --help) usage; exit 0 ;;
+  *) usage; exit 2 ;;
+esac
+export FORMS_START_MODE
+mkdir -p .scratch
+command -v docker >/dev/null 2>&1 || { echo 'Install Docker, then run ./start again.'; exit 1; }
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/app" -w /app node:24.18.0-bookworm node scripts/prepare-start.mjs
+project="forms-$(printf '%s' "$PWD" | cksum | cut -d ' ' -f 1)"
+docker compose -p "$project" -f compose.yml up -d --wait --wait-timeout 3600

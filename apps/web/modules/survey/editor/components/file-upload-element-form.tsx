@@ -1,0 +1,156 @@
+"use client";
+
+import { useAutoAnimate } from "@formkit/auto-animate/react";
+import { PlusIcon } from "lucide-react";
+import { type JSX } from "react";
+import { Trans, useTranslation } from "react-i18next";
+import type { TSurveyElement, TSurveyFileUploadElement } from "@forms/types/surveys/elements";
+import { TSurvey } from "@forms/types/surveys/types";
+import { TUserLocale } from "@forms/types/user";
+import { createI18nString, extractLanguageCodes } from "@/lib/i18n/utils";
+import { ElementFormInput } from "@/modules/survey/components/element-form-input";
+import { ValidationRulesEditor } from "@/modules/survey/editor/components/validation-rules-editor";
+import { AdvancedOptionToggle } from "@/modules/ui/components/advanced-option-toggle";
+import { Button } from "@/modules/ui/components/button";
+import { Input } from "@/modules/ui/components/input";
+
+interface FileUploadFormProps {
+  localSurvey: TSurvey;
+  element: TSurveyFileUploadElement;
+  elementIdx: number;
+  updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
+  isInvalid: boolean;
+  locale: TUserLocale;
+  isStorageConfigured: boolean;
+  isExternalUrlsAllowed?: boolean;
+}
+
+export const FileUploadElementForm = ({
+  localSurvey,
+  element,
+  elementIdx,
+  updateElement,
+  isInvalid,
+  locale,
+  isStorageConfigured = true,
+  isExternalUrlsAllowed,
+}: FileUploadFormProps): JSX.Element => {
+  const { t } = useTranslation();
+  const surveyLanguageCodes = extractLanguageCodes(localSurvey.languages);
+
+  const handleMaxSizeInMBToggle = (checked: boolean) => {
+    const defaultMaxSizeInMB = 1024;
+
+    updateElement(elementIdx, { maxSizeInMB: checked ? defaultMaxSizeInMB : undefined });
+  };
+
+  const [parent] = useAutoAnimate();
+
+  return (
+    <form>
+      <ElementFormInput
+        id="headline"
+        value={element.headline}
+        label={t("workspace.surveys.edit.question") + "*"}
+        localSurvey={localSurvey}
+        elementIdx={elementIdx}
+        isInvalid={isInvalid}
+        updateElement={updateElement}
+        locale={locale}
+        isStorageConfigured={isStorageConfigured}
+        autoFocus={!element.headline?.default || element.headline.default.trim() === ""}
+        isExternalUrlsAllowed={isExternalUrlsAllowed}
+      />
+      <div ref={parent}>
+        {element.subheader !== undefined && (
+          <div className="inline-flex w-full items-center">
+            <div className="w-full">
+              <ElementFormInput
+                id="subheader"
+                value={element.subheader}
+                label={t("common.description")}
+                localSurvey={localSurvey}
+                elementIdx={elementIdx}
+                isInvalid={isInvalid}
+                updateElement={updateElement}
+                locale={locale}
+                isStorageConfigured={isStorageConfigured}
+                autoFocus={!element.subheader?.default || element.subheader.default.trim() === ""}
+                isExternalUrlsAllowed={isExternalUrlsAllowed}
+              />
+            </div>
+          </div>
+        )}
+        {element.subheader === undefined && (
+          <Button
+            size="sm"
+            className="mt-3"
+            variant="secondary"
+            type="button"
+            onClick={() => {
+              updateElement(elementIdx, {
+                subheader: createI18nString("", surveyLanguageCodes),
+              });
+            }}>
+            <PlusIcon className="mr-1 size-4" />
+            {t("workspace.surveys.edit.add_description")}
+          </Button>
+        )}
+      </div>
+      <div className="mt-6 space-y-6">
+        <AdvancedOptionToggle
+          isChecked={element.allowMultipleFiles}
+          onToggle={() => updateElement(elementIdx, { allowMultipleFiles: !element.allowMultipleFiles })}
+          htmlId="allowMultipleFile"
+          title={t("workspace.surveys.edit.allow_multiple_files")}
+          description={t("workspace.surveys.edit.let_people_upload_up_to_25_files_at_the_same_time")}
+          childBorder
+          customContainerClass="p-0"></AdvancedOptionToggle>
+
+        <AdvancedOptionToggle
+          isChecked={!!element.maxSizeInMB}
+          onToggle={handleMaxSizeInMBToggle}
+          htmlId="maxFileSize"
+          title={t("workspace.surveys.edit.max_file_size")}
+          description={t("workspace.surveys.edit.limit_the_maximum_file_size")}
+          childBorder
+          customContainerClass="p-0">
+          <label htmlFor="autoCompleteResponses" className="cursor-pointer bg-slate-50 p-4">
+            <p className="text-sm font-semibold text-slate-700">
+              <Trans
+                i18nKey="workspace.surveys.edit.limit_upload_file_size_to_mb"
+                components={{
+                  fileSizeInput: (
+                    <Input
+                      autoFocus
+                      type="number"
+                      id="fileSizeLimit"
+                      value={element.maxSizeInMB}
+                      onChange={(e) => {
+                        const parsedValue = Number.parseInt(e.target.value, 10);
+
+                        updateElement(elementIdx, { maxSizeInMB: parsedValue });
+                      }}
+                      className="mr-2 ml-2 inline w-20 bg-white text-center text-sm"
+                    />
+                  ),
+                }}
+              />
+            </p>
+          </label>
+        </AdvancedOptionToggle>
+      </div>
+
+      <ValidationRulesEditor
+        elementType={element.type}
+        validation={element.validation}
+        onUpdateValidation={(validation) => {
+          updateElement(elementIdx, {
+            validation,
+          });
+        }}
+        element={element}
+      />
+    </form>
+  );
+};

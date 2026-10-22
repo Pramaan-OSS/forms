@@ -1,0 +1,981 @@
+import { createHash } from "node:crypto";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { type TResponsePipelineJobData, UnrecoverableError } from "@forms/jobs";
+import { selectSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
+import { FollowUpSendError } from "@/modules/survey/follow-ups/types/follow-up";
+import { processResponsePipelineJob } from "./process-response-pipeline-job";
+
+vi.mock("@/modules/text-tools/service", () => ({ analyzeResponse: vi.fn() }));
+
+const online = vi.hoisted(() => ({ enabled: true, deliver: vi.fn(async () => {}) }));
+vi.mock("@/lib/upgrade/compatibility", () => ({ isNewReleaseWorkEnabled: async () => online.enabled }));
+vi.mock("./process-webhook-delivery-job", () => ({ processWebhookDeliveryJob: online.deliver }));
+
+// vitestSetup.ts stubs crypto.createHash to a constant for the license checks. The webhook-id derivation
+// is a subject of this suite, so this file uses the real implementation.
+vi.mock("node:crypto", async (importOriginal) => await importOriginal());
+
+const {
+  mockFilterAuthorizedUserIds,
+  mockIsSurveyVisibilityReady,
+  mockEnqueueWebhookDeliveryJob,
+  mockGetIntegrations,
+  mockGetFinishedResponseCountBySurveyId,
+  mockGetResponseCountBySurveyId,
+  mockHandleIntegrations,
+  mockLoggerError,
+  mockLoggerWarn,
+  mockPrismaOrganizationFindFirst,
+  mockPrismaSurveyFindUnique,
+  mockPrismaSurveyUpdate,
+  mockPrismaUserFindMany,
+  mockPrismaWebhookFindMany,
+  mockSendFollowUpsForResponse,
+  mockSendResponseFinishedEmail,
+} = vi.hoisted(() => {
+  process.env.HUB_API_URL ??= "https://hub.test";
+
+  return {
+    mockFilterAuthorizedUserIds: vi.fn(),
+    mockIsSurveyVisibilityReady: vi.fn(),
+    mockEnqueueWebhookDeliveryJob: vi.fn(),
+    mockGetIntegrations: vi.fn(),
+    mockGetFinishedResponseCountBySurveyId: vi.fn(),
+    mockGetResponseCountBySurveyId: vi.fn(),
+    mockHandleIntegrations: vi.fn(),
+    mockLoggerError: vi.fn(),
+    mockLoggerWarn: vi.fn(),
+    mockPrismaOrganizationFindFirst: vi.fn(),
+    mockPrismaSurveyFindUnique: vi.fn(),
+    mockPrismaSurveyUpdate: vi.fn(),
+    mockPrismaUserFindMany: vi.fn(),
+    mockPrismaWebhookFindMany: vi.fn(),
+    mockSendFollowUpsForResponse: vi.fn(),
+    mockSendResponseFinishedEmail: vi.fn(),
+  };
+});
+
+vi.mock("@forms/database", () => ({
+  prisma: {
+    organization: {
+      findFirst: mockPrismaOrganizationFindFirst,
+    },
+    survey: {
+      findUnique: mockPrismaSurveyFindUnique,
+      update: mockPrismaSurveyUpdate,
+    },
+    webhook: {
+      findMany: mockPrismaWebhookFindMany,
+    },
+    user: {
+      findMany: mockPrismaUserFindMany,
+    },
+  },
+}));
+
+vi.mock("@forms/jobs", () => ({
+  UnrecoverableError: class UnrecoverableError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = "UnrecoverableError";
+    }
+  },
+  enqueueWebhookDeliveryJob: mockEnqueueWebhookDeliveryJob,
+}));
+
+vi.mock(import("@/lib/constants"), async (importOriginal) => {
+  const actual = await importOriginal();
+
+  return {
+    ...actual,
+  };
+});
+
+vi.mock("./handle-integrations", () => ({
+  handleIntegrations: mockHandleIntegrations,
+}));
+
+vi.mock("@/lib/telemetry/usage-update", () => ({}));
+
+vi.mock("@/lib/integration/service", () => ({
+  getIntegrations: mockGetIntegrations,
+}));
+
+vi.mock("@/lib/response/service", () => ({
+  getResponseCountBySurveyId: mockGetResponseCountBySurveyId,
+}));
+
+vi.mock("@/modules/survey/lib/response", () => ({
+  getFinishedResponseCountBySurveyId: mockGetFinishedResponseCountBySurveyId,
+}));
+
+vi.mock("@/modules/ee/billing/lib/metering", () => ({}));
+
+vi.mock("@/modules/email", () => ({
+  sendResponseFinishedEmail: mockSendResponseFinishedEmail,
+}));
+
+vi.mock("@/modules/survey/follow-ups/lib/follow-ups", () => ({
+  sendFollowUpsForResponse: mockSendFollowUpsForResponse,
+}));
+
+vi.mock("@/modules/ee/workflows/lib/runner/enqueue-response-completed-runs", () => ({}));
+
+vi.mock("@/modules/ee/workflows/lib/runner/dispatch", () => ({
+  dispatchWorkflowRunViaJobs: vi.fn(),
+}));
+
+vi.mock("@/lib/authorization/user-list", () => ({ filterAuthorizedUserIds: mockFilterAuthorizedUserIds }));
+vi.mock("@/lib/authzed/scope-readiness", () => ({ isSurveyVisibilityReady: mockIsSurveyVisibilityReady }));
+
+vi.mock("@forms/logger", () => ({
+  logger: {
+    debug: vi.fn(),
+    error: mockLoggerError,
+    info: vi.fn(),
+    warn: mockLoggerWarn,
+  },
+}));
+
+const baseData: TResponsePipelineJobData = {
+  workspaceId: "workspace_123",
+  event: "responseCreated",
+  response: {
+    contact: null,
+    contactAttributes: null,
+    createdAt: new Date("2026-04-08T10:00:00.000Z"),
+    data: { answer: "yes" },
+    displayId: null,
+    endingId: null,
+    finished: true,
+    id: "response_123",
+    language: null,
+    meta: {},
+    singleUseId: null,
+    surveyId: "survey_123",
+    tags: [],
+    updatedAt: new Date("2026-04-08T10:00:00.000Z"),
+    variables: {},
+  },
+  surveyId: "survey_123",
+};
+
+const baseContext = {
+  attempt: 1,
+  jobId: "job_123",
+  jobName: "response-pipeline.process",
+  maxAttempts: 3,
+  queueName: "background-jobs",
+};
+
+const finalAttemptContext = {
+  ...baseContext,
+  attempt: baseContext.maxAttempts,
+};
+
+const organization = {
+  billing: {
+    stripeCustomerId: "cus_123",
+  },
+  displayTimeZone: null,
+  id: "org_123",
+};
+
+const survey = {
+  visibility: "workspace",
+  visibilityVersion: 0,
+  visibilityProjectedVersion: 0,
+  blocks: [],
+  autoComplete: null,
+  createdAt: new Date("2026-04-01T10:00:00.000Z"),
+  followUps: [],
+  hiddenFields: {
+    fieldIds: [],
+  },
+  id: "survey_123",
+  languages: [],
+  name: "Test survey",
+  status: "inProgress",
+  type: "app",
+  updatedAt: new Date("2026-04-01T10:00:00.000Z"),
+  variables: [],
+  workspaceId: "workspace_123",
+};
+
+const webhookRow = { id: "webhook_123" };
+
+const expectedWebhookMessageId = (jobId: string, webhookId: string, event: string): string =>
+  createHash("sha256").update(`${jobId}:${webhookId}:${event}`).digest("hex");
+
+describe("processResponsePipelineJob", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    online.enabled = true;
+    mockFilterAuthorizedUserIds.mockImplementation(async (ids: string[]) => new Set(ids));
+    mockPrismaOrganizationFindFirst.mockResolvedValue(organization);
+    mockPrismaSurveyFindUnique.mockResolvedValue(survey);
+    mockGetIntegrations.mockResolvedValue([]);
+    mockPrismaWebhookFindMany.mockResolvedValue([]);
+    mockPrismaUserFindMany.mockResolvedValue([]);
+    mockIsSurveyVisibilityReady.mockResolvedValue(false);
+    mockGetResponseCountBySurveyId.mockResolvedValue(7);
+    mockGetFinishedResponseCountBySurveyId.mockResolvedValue(1);
+    mockHandleIntegrations.mockResolvedValue(undefined);
+    mockEnqueueWebhookDeliveryJob.mockResolvedValue({ id: "whd-job_123-webhook_123" });
+    mockSendResponseFinishedEmail.mockResolvedValue(undefined);
+    mockSendFollowUpsForResponse.mockResolvedValue({ ok: true, data: [] });
+    mockPrismaSurveyUpdate.mockResolvedValue(undefined);
+  });
+
+  /**
+   * ENG-1845: the pipeline's readers — the notification email, follow-ups and integrations — resolve
+   * Embedded Data definitions through the joined rows, and `getSurveyEmbeddedFields` fails closed. A
+   * select that loses the join reports every field as unset rather than erroring, so the join belongs
+   * in a test rather than only in a comment.
+   */
+  test("selects the Embedded Data join its readers resolve definitions through", async () => {
+    await processResponsePipelineJob(baseData, baseContext);
+
+    expect(mockPrismaSurveyFindUnique.mock.calls[0][0].select).toEqual(
+      expect.objectContaining({ embeddedDataLinks: selectSurveyEmbeddedDataLinks })
+    );
+  });
+
+  test("processes responseCreated jobs with webhook fan-out and telemetry side effects", async () => {
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+
+    await expect(processResponsePipelineJob(baseData, baseContext)).resolves.toBeUndefined();
+
+    // Ids only — the delivery job re-reads url and secret, so neither is loaded here or put in Redis.
+    expect(mockPrismaWebhookFindMany).toHaveBeenCalledWith({
+      where: {
+        OR: [{ surveyIds: { has: "survey_123" } }, { surveyIds: { isEmpty: true } }],
+        workspaceId: "workspace_123",
+        triggers: { has: "responseCreated" },
+      },
+      select: { id: true },
+    });
+    expect(mockEnqueueWebhookDeliveryJob).toHaveBeenCalledTimes(1);
+    expect(mockEnqueueWebhookDeliveryJob).toHaveBeenCalledWith(
+      {
+        webhookId: "webhook_123",
+        workspaceId: "workspace_123",
+        surveyId: "survey_123",
+        event: "responseCreated",
+        webhookMessageId: expectedWebhookMessageId("job_123", "webhook_123", "responseCreated"),
+        response: baseData.response,
+        survey: {
+          name: "Test survey",
+          type: "app",
+          status: "inProgress",
+          createdAt: survey.createdAt,
+          updatedAt: survey.updatedAt,
+        },
+      },
+      { jobId: "whd-job_123-webhook_123" }
+    );
+    expect(mockHandleIntegrations).not.toHaveBeenCalled();
+  });
+
+  test("derives a stable webhook id from the pipeline job across retry attempts", async () => {
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+
+    await expect(processResponsePipelineJob(baseData, baseContext)).resolves.toBeUndefined();
+    await expect(processResponsePipelineJob(baseData, finalAttemptContext)).resolves.toBeUndefined();
+
+    const messageIds = mockEnqueueWebhookDeliveryJob.mock.calls.map(([payload]) => payload.webhookMessageId);
+    const jobIds = mockEnqueueWebhookDeliveryJob.mock.calls.map(([, options]) => options.jobId);
+
+    // The exact pre-fan-out derivation, pinned: receivers dedupe on it.
+    expect(messageIds).toEqual([
+      expectedWebhookMessageId("job_123", "webhook_123", "responseCreated"),
+      expectedWebhookMessageId("job_123", "webhook_123", "responseCreated"),
+    ]);
+    // Same deterministic child jobId on the retry, so BullMQ dedupes the re-enqueue.
+    expect(jobIds).toEqual(["whd-job_123-webhook_123", "whd-job_123-webhook_123"]);
+  });
+
+  test("enqueues one delivery job per matching webhook with distinct ids", async () => {
+    mockPrismaWebhookFindMany.mockResolvedValue([
+      { id: "webhook_a" },
+      { id: "webhook_b" },
+      { id: "webhook_c" },
+    ]);
+
+    await expect(processResponsePipelineJob(baseData, baseContext)).resolves.toBeUndefined();
+
+    expect(mockEnqueueWebhookDeliveryJob).toHaveBeenCalledTimes(3);
+    const jobIds = mockEnqueueWebhookDeliveryJob.mock.calls.map(([, options]) => options.jobId);
+    const messageIds = mockEnqueueWebhookDeliveryJob.mock.calls.map(([payload]) => payload.webhookMessageId);
+    expect(jobIds).toEqual(["whd-job_123-webhook_a", "whd-job_123-webhook_b", "whd-job_123-webhook_c"]);
+    expect(new Set(messageIds).size).toBe(3);
+  });
+
+  test("does not enqueue any delivery job when no webhook matches", async () => {
+    mockPrismaWebhookFindMany.mockResolvedValue([]);
+
+    await expect(processResponsePipelineJob(baseData, baseContext)).resolves.toBeUndefined();
+
+    expect(mockEnqueueWebhookDeliveryJob).not.toHaveBeenCalled();
+  });
+
+  test("sends nothing out of the app for a restricted survey, even to a wildcard webhook", async () => {
+    mockIsSurveyVisibilityReady.mockResolvedValue(true);
+    mockPrismaSurveyFindUnique.mockResolvedValue({
+      ...survey,
+      followUps: [{ id: "followup_123" }],
+      visibility: "restricted",
+      visibilityProjectedVersion: 2,
+      visibilityVersion: 2,
+    });
+    // An all-surveys webhook matches every survey in the workspace, the restricted one included.
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+    mockGetIntegrations.mockResolvedValue([{ id: "integration_123", type: "slack" }]);
+
+    await processResponsePipelineJob({ ...baseData, event: "responseFinished" }, baseContext);
+
+    expect(mockEnqueueWebhookDeliveryJob).not.toHaveBeenCalled();
+    expect(mockGetIntegrations).not.toHaveBeenCalled();
+    expect(mockHandleIntegrations).not.toHaveBeenCalled();
+    expect(mockSendFollowUpsForResponse).not.toHaveBeenCalled();
+  });
+
+  test("alerts only authorized subscribers for a restricted survey", async () => {
+    mockPrismaSurveyFindUnique.mockResolvedValue({ ...survey, visibility: "restricted" });
+    mockPrismaUserFindMany.mockResolvedValue([
+      { email: "owner@example.com", id: "user_owner", locale: "en" },
+      { email: "member@example.com", id: "user_member", locale: "en" },
+    ]);
+    mockFilterAuthorizedUserIds.mockResolvedValue(new Set(["user_owner"]));
+
+    await processResponsePipelineJob({ ...baseData, event: "responseFinished" }, baseContext);
+
+    expect(mockFilterAuthorizedUserIds).toHaveBeenCalledWith(
+      ["user_owner", "user_member"],
+      "survey.response_read",
+      {
+        id: "survey_123",
+        type: "survey",
+      }
+    );
+    expect(mockSendResponseFinishedEmail).toHaveBeenCalledTimes(1);
+    expect(mockSendResponseFinishedEmail.mock.calls[0][0]).toBe("owner@example.com");
+  });
+
+  test("processes responseFinished jobs and preserves legacy side effects", async () => {
+    mockGetIntegrations.mockResolvedValue([{ id: "integration_123", type: "slack" }]);
+    mockPrismaSurveyFindUnique.mockResolvedValue({
+      ...survey,
+      autoComplete: 1,
+      followUps: [{ id: "followup_123" }],
+    });
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+    mockPrismaUserFindMany.mockResolvedValue([
+      {
+        email: "owner@example.com",
+        locale: "en",
+      },
+    ]);
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+          locale: "de-DE",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockHandleIntegrations).toHaveBeenCalledWith(
+      [{ id: "integration_123", type: "slack" }],
+      expect.objectContaining({ event: "responseFinished" }),
+      {
+        ...survey,
+        autoComplete: 1,
+        followUps: [{ id: "followup_123" }],
+      },
+      "UTC"
+    );
+    expect(mockPrismaUserFindMany).toHaveBeenCalledWith({
+      select: { email: true, id: true, locale: true },
+      where: {
+        memberships: {
+          some: {
+            organization: {
+              workspaces: {
+                some: {
+                  id: "workspace_123",
+                },
+              },
+            },
+          },
+        },
+        notificationSettings: {
+          equals: true,
+          path: ["alert", "survey_123"],
+        },
+        OR: [
+          {
+            memberships: {
+              some: {
+                role: {
+                  in: ["owner", "manager"],
+                },
+                organization: {
+                  workspaces: {
+                    some: {
+                      id: "workspace_123",
+                    },
+                  },
+                },
+              },
+            },
+          },
+          {
+            teamUsers: {
+              some: {
+                team: {
+                  workspaceTeams: {
+                    some: {
+                      workspace: {
+                        id: "workspace_123",
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        ],
+      },
+    });
+    expect(mockSendFollowUpsForResponse).toHaveBeenCalledWith("response_123", "de-DE");
+    expect(mockSendResponseFinishedEmail).toHaveBeenCalledWith(
+      "owner@example.com",
+      "en-US",
+      "workspace_123",
+      expect.objectContaining({ id: "survey_123" }),
+      baseData.response,
+      // The notification email deliberately reports the *total* response count, not the
+      // completed-only count the response limit uses.
+      7
+    );
+    expect(mockPrismaSurveyUpdate).toHaveBeenCalledWith({
+      data: {
+        status: "completed",
+      },
+      where: {
+        id: "survey_123",
+      },
+    });
+  });
+
+  test("only counts finished responses towards the auto-complete response limit", async () => {
+    // Total responses (starts) far exceed the limit, but finished responses do not.
+    mockGetResponseCountBySurveyId.mockResolvedValue(500);
+    mockGetFinishedResponseCountBySurveyId.mockResolvedValue(3);
+    mockPrismaSurveyFindUnique.mockResolvedValue({
+      ...survey,
+      autoComplete: 5,
+    });
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    // The auto-complete decision must be based on finished responses only.
+    expect(mockGetFinishedResponseCountBySurveyId).toHaveBeenCalledWith("survey_123");
+    // 3 finished responses < limit of 5 → the survey must stay open.
+    expect(mockPrismaSurveyUpdate).not.toHaveBeenCalled();
+  });
+
+  test("auto-completes the survey once finished responses reach the limit", async () => {
+    mockGetFinishedResponseCountBySurveyId.mockResolvedValue(5);
+    mockPrismaSurveyFindUnique.mockResolvedValue({
+      ...survey,
+      autoComplete: 5,
+    });
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockPrismaSurveyUpdate).toHaveBeenCalledWith({
+      data: {
+        status: "completed",
+      },
+      where: {
+        id: "survey_123",
+      },
+    });
+  });
+
+  test("does not count finished responses when no response limit is set", async () => {
+    // The default survey fixture has autoComplete: null.
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockGetFinishedResponseCountBySurveyId).not.toHaveBeenCalled();
+    expect(mockPrismaSurveyUpdate).not.toHaveBeenCalled();
+  });
+
+  test("does not re-close a survey that is already completed", async () => {
+    mockGetFinishedResponseCountBySurveyId.mockResolvedValue(50);
+    mockPrismaSurveyFindUnique.mockResolvedValue({
+      ...survey,
+      autoComplete: 5,
+      status: "completed",
+    });
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockGetFinishedResponseCountBySurveyId).not.toHaveBeenCalled();
+    expect(mockPrismaSurveyUpdate).not.toHaveBeenCalled();
+  });
+
+  test("does not count total responses when nobody subscribes to notifications", async () => {
+    // No user has response notifications enabled, so nothing consumes the total count.
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockPrismaUserFindMany).toHaveBeenCalled();
+    expect(mockGetResponseCountBySurveyId).not.toHaveBeenCalled();
+    expect(mockSendResponseFinishedEmail).not.toHaveBeenCalled();
+  });
+
+  test("skips auto-complete when the finished response count cannot be loaded", async () => {
+    const countError = new Error("count offline");
+    mockPrismaSurveyFindUnique.mockResolvedValue({
+      ...survey,
+      autoComplete: 1,
+    });
+    mockGetFinishedResponseCountBySurveyId.mockRejectedValue(countError);
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        autoCompleteThreshold: 1,
+        err: countError,
+      }),
+      "Response pipeline survey auto-complete skipped because the finished response count could not be loaded"
+    );
+    expect(mockPrismaSurveyUpdate).not.toHaveBeenCalled();
+  });
+
+  test("logs responseFinished side-effect failures without failing the job", async () => {
+    mockPrismaUserFindMany.mockResolvedValue([
+      {
+        email: "owner@example.com",
+        locale: "en",
+      },
+    ]);
+    mockSendResponseFinishedEmail.mockRejectedValue(new Error("smtp failed"));
+    mockSendFollowUpsForResponse.mockResolvedValue({
+      ok: false,
+      error: {
+        code: FollowUpSendError.FOLLOW_UP_NOT_ALLOWED,
+        message: "not allowed",
+      },
+    });
+    mockPrismaSurveyUpdate.mockRejectedValue(new Error("update failed"));
+    mockPrismaSurveyFindUnique.mockResolvedValue({
+      ...survey,
+      autoComplete: 1,
+      followUps: [{ id: "followup_123" }],
+    });
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: expect.any(Error),
+        userEmail: "owner@example.com",
+      }),
+      "Response pipeline notification email failed"
+    );
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: expect.any(Error),
+      }),
+      "Response pipeline survey auto-complete update failed"
+    );
+  });
+
+  test("delivers webhooks inline during overlap without exposing the new job type to old workers", async () => {
+    online.enabled = false;
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+    await processResponsePipelineJob(baseData, baseContext);
+    expect(mockEnqueueWebhookDeliveryJob).not.toHaveBeenCalled();
+    expect(online.deliver).toHaveBeenCalledOnce();
+    expect(online.deliver).toHaveBeenCalledWith(
+      expect.objectContaining({ webhookId: webhookRow.id }),
+      expect.objectContaining({ attempt: baseContext.attempt })
+    );
+  });
+
+  test("excludes unauthorized billing subscribers even from workspace-visible response alerts", async () => {
+    mockPrismaUserFindMany.mockResolvedValue([
+      { id: "member", email: "member@example.com", locale: "en-US" },
+      { id: "billing", email: "billing@example.com", locale: "en-US" },
+    ]);
+    mockFilterAuthorizedUserIds.mockResolvedValue(new Set(["member"]));
+    await processResponsePipelineJob({ ...baseData, event: "responseFinished" }, baseContext);
+    expect(mockFilterAuthorizedUserIds).toHaveBeenCalledWith(["member", "billing"], "survey.response_read", {
+      id: baseData.surveyId,
+      type: "survey",
+    });
+    expect(mockSendResponseFinishedEmail).toHaveBeenCalledOnce();
+    expect(mockSendResponseFinishedEmail.mock.calls[0][0]).toBe("member@example.com");
+  });
+
+  test("continues side effects after a permanently rejected inline webhook", async () => {
+    online.enabled = false;
+    const failure = new UnrecoverableError("receiver 404");
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow, { ...webhookRow, id: "healthy" }]);
+    online.deliver.mockRejectedValueOnce(failure).mockResolvedValueOnce(undefined);
+    mockGetIntegrations.mockResolvedValue([{ id: "integration_123", type: "slack" }]);
+    await expect(
+      processResponsePipelineJob({ ...baseData, event: "responseFinished" }, baseContext)
+    ).resolves.toBeUndefined();
+    expect(online.deliver).toHaveBeenCalledTimes(2);
+    expect(mockHandleIntegrations).toHaveBeenCalledOnce();
+    expect(mockEnqueueWebhookDeliveryJob).not.toHaveBeenCalled();
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({ webhookId: webhookRow.id, err: failure }),
+      "Inline webhook delivery failed permanently; continuing response processing"
+    );
+  });
+
+  test("retains legacy durable pipeline retries before any other response side effects", async () => {
+    online.enabled = false;
+    const failure = new Error("receiver 503");
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+    online.deliver.mockRejectedValueOnce(failure).mockResolvedValueOnce(undefined);
+    mockGetIntegrations.mockResolvedValue([{ id: "integration_123", type: "slack" }]);
+    const data = { ...baseData, event: "responseFinished" as const };
+    await expect(processResponsePipelineJob(data, baseContext)).rejects.toThrow(failure);
+    expect(mockHandleIntegrations).not.toHaveBeenCalled();
+    expect(mockSendResponseFinishedEmail).not.toHaveBeenCalled();
+    expect(mockSendFollowUpsForResponse).not.toHaveBeenCalled();
+    await expect(
+      processResponsePipelineJob(data, { ...baseContext, attempt: baseContext.attempt + 1 })
+    ).resolves.toBeUndefined();
+    expect(mockHandleIntegrations).toHaveBeenCalledOnce();
+    expect(mockEnqueueWebhookDeliveryJob).not.toHaveBeenCalled();
+  });
+
+  test("finishes remaining response side effects when inline delivery exhausts its retry budget", async () => {
+    online.enabled = false;
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+    online.deliver.mockRejectedValue(new Error("receiver 503"));
+    mockGetIntegrations.mockResolvedValue([{ id: "integration_123", type: "slack" }]);
+    await expect(
+      processResponsePipelineJob(
+        { ...baseData, event: "responseFinished" },
+        { ...baseContext, attempt: baseContext.maxAttempts }
+      )
+    ).resolves.toBeUndefined();
+    expect(mockHandleIntegrations).toHaveBeenCalledOnce();
+    expect(mockEnqueueWebhookDeliveryJob).not.toHaveBeenCalled();
+  });
+
+  test("fails the job before the final attempt when a webhook delivery cannot be enqueued", async () => {
+    const enqueueError = new Error("redis unavailable");
+    mockGetIntegrations.mockResolvedValue([{ id: "integration_123", type: "slack" }]);
+    mockPrismaSurveyFindUnique.mockResolvedValue({
+      ...survey,
+      autoComplete: 1,
+      followUps: [{ id: "followup_123" }],
+    });
+    mockPrismaUserFindMany.mockResolvedValue([
+      {
+        email: "owner@example.com",
+        locale: "en",
+      },
+    ]);
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+    mockEnqueueWebhookDeliveryJob.mockRejectedValue(enqueueError);
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).rejects.toThrow("redis unavailable");
+
+    // The retry re-runs the fan-out with the same deterministic child ids, so failing here is safe.
+    expect(mockHandleIntegrations).not.toHaveBeenCalled();
+    expect(mockSendFollowUpsForResponse).not.toHaveBeenCalled();
+    expect(mockSendResponseFinishedEmail).not.toHaveBeenCalled();
+    expect(mockPrismaSurveyUpdate).not.toHaveBeenCalled();
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: enqueueError,
+        jobId: "job_123",
+      }),
+      "Response pipeline job failed"
+    );
+  });
+
+  test("continues responseFinished side effects when the fan-out fails on the final attempt", async () => {
+    const enqueueError = new Error("redis unavailable");
+    mockGetIntegrations.mockResolvedValue([{ id: "integration_123", type: "slack" }]);
+    mockPrismaSurveyFindUnique.mockResolvedValue({
+      ...survey,
+      autoComplete: 1,
+      followUps: [{ id: "followup_123" }],
+    });
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+    mockPrismaUserFindMany.mockResolvedValue([
+      {
+        email: "owner@example.com",
+        locale: "en",
+      },
+    ]);
+    mockEnqueueWebhookDeliveryJob.mockRejectedValue(enqueueError);
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        finalAttemptContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockHandleIntegrations).toHaveBeenCalledTimes(1);
+    expect(mockSendFollowUpsForResponse).toHaveBeenCalledWith("response_123", undefined);
+    expect(mockSendResponseFinishedEmail).toHaveBeenCalledTimes(1);
+    expect(mockPrismaSurveyUpdate).toHaveBeenCalledTimes(1);
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attempt: 3,
+        // The final attempt is the one that drops the deliveries, so it must name the cause
+        // itself — no later log carries it.
+        err: enqueueError,
+        failedWebhookCount: 1,
+        maxAttempts: 3,
+      }),
+      "Response pipeline webhook delivery enqueue exhausted retries; continuing with remaining side effects"
+    );
+  });
+
+  test("threads the organization display time zone into integrations", async () => {
+    mockPrismaOrganizationFindFirst.mockResolvedValue({
+      ...organization,
+      displayTimeZone: "Asia/Manila",
+    });
+    mockGetIntegrations.mockResolvedValue([{ id: "integration_123", type: "slack" }]);
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockHandleIntegrations).toHaveBeenCalledWith(
+      [{ id: "integration_123", type: "slack" }],
+      expect.objectContaining({ event: "responseFinished" }),
+      expect.anything(),
+      "Asia/Manila"
+    );
+  });
+
+  test("logs integration failures without failing the responseFinished job", async () => {
+    const integrationError = new Error("slack offline");
+    mockGetIntegrations.mockResolvedValue([{ id: "integration_123", type: "slack" }]);
+    mockHandleIntegrations.mockRejectedValue(integrationError);
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: integrationError,
+        event: "responseFinished",
+        jobId: "job_123",
+      }),
+      "Response pipeline integration handling failed"
+    );
+  });
+
+  test("logs response count lookup failures without retrying successful webhooks", async () => {
+    const responseCountError = new Error("count offline");
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+    // The total count is only looked up when a notification recipient consumes it.
+    mockPrismaUserFindMany.mockResolvedValue([
+      {
+        email: "owner@example.com",
+        locale: "en",
+      },
+    ]);
+    mockGetResponseCountBySurveyId.mockRejectedValue(responseCountError);
+
+    await expect(
+      processResponsePipelineJob(
+        {
+          ...baseData,
+          event: "responseFinished",
+        },
+        baseContext
+      )
+    ).resolves.toBeUndefined();
+
+    expect(mockEnqueueWebhookDeliveryJob).toHaveBeenCalledTimes(1);
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: responseCountError,
+        event: "responseFinished",
+        jobId: "job_123",
+      }),
+      "Response pipeline response count lookup failed"
+    );
+    expect(mockSendResponseFinishedEmail).not.toHaveBeenCalled();
+  });
+
+  test("continues responseCreated side effects when the fan-out fails on the final attempt", async () => {
+    mockPrismaWebhookFindMany.mockResolvedValue([webhookRow]);
+    mockEnqueueWebhookDeliveryJob.mockRejectedValue(new Error("redis unavailable"));
+
+    await expect(processResponsePipelineJob(baseData, finalAttemptContext)).resolves.toBeUndefined();
+
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attempt: 3,
+        failedWebhookCount: 1,
+        maxAttempts: 3,
+      }),
+      "Response pipeline webhook delivery enqueue exhausted retries; continuing with remaining side effects"
+    );
+  });
+
+  test("fails fast when the workspace organization cannot be found", async () => {
+    mockPrismaOrganizationFindFirst.mockResolvedValue(null);
+
+    await expect(processResponsePipelineJob(baseData, baseContext)).rejects.toThrow(
+      "Organization not found for workspace workspace_123"
+    );
+
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceId: "workspace_123",
+        err: expect.any(Error),
+        jobId: "job_123",
+        responseId: "response_123",
+        surveyId: "survey_123",
+      }),
+      "Response pipeline job failed"
+    );
+  });
+
+  test("fails fast when the survey cannot be found", async () => {
+    mockPrismaSurveyFindUnique.mockResolvedValue(null);
+
+    await expect(processResponsePipelineJob(baseData, baseContext)).rejects.toThrow(
+      "Survey survey_123 not found"
+    );
+
+    expect(mockLoggerError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceId: "workspace_123",
+        err: expect.any(Error),
+        jobId: "job_123",
+        responseId: "response_123",
+        surveyId: "survey_123",
+      }),
+      "Response pipeline job failed"
+    );
+  });
+
+  test("classifies database pool exhaustion as retryable and logs a warning", async () => {
+    const poolExhaustionError = new Error("Timed out fetching a new connection from the connection pool");
+    mockPrismaSurveyFindUnique.mockRejectedValue(poolExhaustionError);
+
+    await expect(processResponsePipelineJob(baseData, baseContext)).rejects.toThrow(poolExhaustionError);
+
+    expect(mockLoggerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceId: "workspace_123",
+        err: poolExhaustionError,
+        jobId: "job_123",
+        responseId: "response_123",
+        surveyId: "survey_123",
+      }),
+      "Response pipeline job hit database pool exhaustion and will be retried"
+    );
+    expect(mockLoggerError).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        err: poolExhaustionError,
+      }),
+      "Response pipeline job failed"
+    );
+  });
+});

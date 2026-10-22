@@ -1,0 +1,1312 @@
+import { NextRequest } from "next/server";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { z } from "zod";
+import { ResourceNotFoundError, TooManyRequestsError } from "@forms/types/errors";
+import { reportApiError } from "@/app/lib/api/api-error-reporter";
+import { ConcurrencyLimiter } from "@/app/lib/api/concurrency-limiter";
+import { DEFAULT_REQUEST_BODY_LIMIT_BYTES } from "@/app/lib/api/request-body";
+import { formatZodIssues, withV3ApiWrapper } from "./api-wrapper";
+import { V3_REQUEST_ARRAY_MAX_ITEMS, V3_REQUEST_MAX_DEPTH } from "./array-budget";
+import { V3_INVALID_PARAMS_MAX } from "./invalid-params";
+
+const { mockAuthenticateRequest, mockGetSession } = vi.hoisted(() => ({
+  mockAuthenticateRequest: vi.fn(),
+  mockGetSession: vi.fn(),
+}));
+
+const { mockBuildAuditLogBaseObject } = vi.hoisted(() => ({
+  mockBuildAuditLogBaseObject: vi.fn((action: string, targetType: string, apiUrl: string) => ({
+    action,
+    targetType,
+    userId: "unknown",
+    targetId: "unknown",
+    organizationId: "unknown",
+    status: "failure",
+    oldObject: undefined,
+    newObject: undefined,
+    userType: "api",
+    apiUrl,
+  })),
+}));
+
+const { mockLoggerWarn, mockLoggerError } = vi.hoisted(() => ({
+  mockLoggerWarn: vi.fn(),
+  mockLoggerError: vi.fn(),
+}));
+
+vi.mock("@/modules/auth/lib/session", () => ({
+  getSession: mockGetSession,
+}));
+
+vi.mock("@/app/api/v1/auth", () => ({
+  authenticateRequest: mockAuthenticateRequest,
+}));
+
+vi.mock("@/modules/core/rate-limit/helpers", () => ({
+  applyRateLimit: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("@/app/lib/api/with-api-logging", () => ({
+  buildAuditLogBaseObject: mockBuildAuditLogBaseObject,
+}));
+
+vi.mock("@/app/lib/api/api-error-reporter", () => ({ reportApiError: vi.fn() }));
+vi.mock("@forms/logger", () => ({
+  logger: {
+    withContext: vi.fn(() => ({
+      error: mockLoggerError,
+      warn: mockLoggerWarn,
+    })),
+  },
+}));
+
+describe("withV3ApiWrapper", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockGetSession.mockResolvedValue(null);
+    mockAuthenticateRequest.mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  test("uses session auth first in both mode and injects request id into plain responses", async () => {
+    const { applyRateLimit } = await import("@/modules/core/rate-limit/helpers");
+    mockGetSession.mockResolvedValue({
+      user: { id: "user_1", name: "Test", email: "t@example.com" },
+      expires: "2026-01-01",
+    });
+
+    const handler = vi.fn(async ({ authentication, requestId, instance }) => {
+      expect(authentication).toMatchObject({ user: { id: "user_1" } });
+      expect(requestId).toBe("req-1");
+      expect(instance).toBe("/api/v3/surveys");
+      return Response.json({ ok: true });
+    });
+
+    const wrapped = withV3ApiWrapper({
+      auth: "both",
+      handler,
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys?limit=10", {
+        headers: { "x-request-id": "req-1" },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Request-Id")).toBe("req-1");
+    expect(handler).toHaveBeenCalledOnce();
+    expect(vi.mocked(applyRateLimit)).toHaveBeenCalledWith(
+      expect.objectContaining({ namespace: "api:v3" }),
+      "user_1"
+    );
+    expect(mockAuthenticateRequest).not.toHaveBeenCalled();
+  });
+
+  test("falls back to api key auth in both mode", async () => {
+    const { applyRateLimit } = await import("@/modules/core/rate-limit/helpers");
+    mockAuthenticateRequest.mockResolvedValue({
+      type: "apiKey",
+      apiKeyId: "key_1",
+      organizationId: "org_1",
+      organizationAccess: { accessControl: { read: true, write: false } },
+      workspacePermissions: [],
+    });
+
+    const handler = vi.fn(async ({ authentication }) => {
+      expect(authentication).toMatchObject({ apiKeyId: "key_1" });
+      return Response.json({ ok: true });
+    });
+
+    const wrapped = withV3ApiWrapper({
+      auth: "both",
+      handler,
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        headers: { "x-api-key": "fbk_test" },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(200);
+    expect(vi.mocked(applyRateLimit)).toHaveBeenCalledWith(
+      expect.objectContaining({ namespace: "api:v3" }),
+      "key_1"
+    );
+    expect(mockGetSession).not.toHaveBeenCalled();
+  });
+
+  test("uses bearer API keys before session auth in both mode", async () => {
+    mockGetSession.mockResolvedValue({
+      user: { id: "user_1", name: "Test", email: "t@example.com" },
+      expires: "2026-01-01",
+    });
+    mockAuthenticateRequest.mockResolvedValue({
+      type: "apiKey",
+      apiKeyId: "key_2",
+      organizationId: "org_1",
+      organizationAccess: { accessControl: { read: true, write: true } },
+      workspacePermissions: [],
+    });
+
+    const wrapped = withV3ApiWrapper({
+      auth: "both",
+      handler: async ({ authentication }) => {
+        expect(authentication).toMatchObject({ apiKeyId: "key_2" });
+        return Response.json({ ok: true });
+      },
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        headers: { authorization: "Bearer fbk_test" },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(200);
+    expect(mockAuthenticateRequest).toHaveBeenCalledOnce();
+    expect(mockGetSession).not.toHaveBeenCalled();
+  });
+
+  test("returns 401 problem response when authentication is required but missing", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const wrapped = withV3ApiWrapper({
+      auth: "both",
+      handler,
+    });
+
+    const response = await wrapped(new NextRequest("http://localhost/api/v3/surveys"), {} as never);
+
+    expect(response.status).toBe(401);
+    expect(handler).not.toHaveBeenCalled();
+    expect(response.headers.get("Content-Type")).toBe("application/problem+json");
+    expect(mockLoggerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        statusCode: 401,
+        detail: "Not authenticated",
+      }),
+      "V3 API authentication failed"
+    );
+  });
+
+  /**
+   * RFC 9110 §15.5.2 asks a 401 for a challenge "applicable to the target resource". Bearer is applicable
+   * where this API accepts `Authorization: Bearer <fbk_…>` — the `apiKey` and `both` modes — and is a
+   * false statement on a session-cookie route, which consults no HTTP authentication scheme at all.
+   * Pinned per mode, because the difference is the whole point and a single default cannot express it.
+   */
+  test("a 401 on a bearer-accepting route carries the challenge", async () => {
+    const wrapped = withV3ApiWrapper({
+      auth: "both",
+      handler: vi.fn(async () => Response.json({ ok: true })),
+    });
+
+    const response = await wrapped(new NextRequest("http://localhost/api/v3/surveys"), {} as never);
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("WWW-Authenticate")).toBe('Bearer realm="forms"');
+  });
+
+  test("a 401 on a session-only route carries no challenge", async () => {
+    mockGetSession.mockResolvedValue(null);
+    const wrapped = withV3ApiWrapper({
+      auth: "session",
+      handler: vi.fn(async () => Response.json({ ok: true })),
+    });
+
+    const response = await wrapped(new NextRequest("http://localhost/api/v3/tags"), {} as never);
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("WWW-Authenticate")).toBeNull();
+  });
+
+  test("returns 400 problem response for invalid query input", async () => {
+    mockGetSession.mockResolvedValue({
+      user: { id: "user_1" },
+      expires: "2026-01-01",
+    });
+
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const wrapped = withV3ApiWrapper({
+      auth: "both",
+      schemas: {
+        query: z.object({
+          limit: z.coerce.number().int().positive(),
+        }),
+      },
+      handler,
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys?limit=oops", {
+        headers: { "x-request-id": "req-invalid" },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(400);
+    expect(handler).not.toHaveBeenCalled();
+    const body = await response.json();
+    expect(body.invalid_params).toEqual(expect.arrayContaining([expect.objectContaining({ name: "limit" })]));
+    expect(body.requestId).toBe("req-invalid");
+    expect(mockLoggerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        statusCode: 400,
+        detail: "Invalid query parameters",
+        invalidParamCount: 1,
+        invalidParamNames: ["limit"],
+      }),
+      "V3 API request validation failed"
+    );
+  });
+
+  test("parses body, repeated query params, and async route params", async () => {
+    const handler = vi.fn(async ({ parsedInput }) => {
+      expect(parsedInput).toEqual({
+        body: { name: "Survey API" },
+        query: { tag: ["a", "b"] },
+        params: { workspaceId: "ws_123" },
+      });
+
+      return Response.json(
+        { ok: true },
+        {
+          headers: {
+            "X-Request-Id": "handler-request-id",
+          },
+        }
+      );
+    });
+
+    const wrapped = withV3ApiWrapper({
+      auth: "none",
+      schemas: {
+        body: z.object({
+          name: z.string(),
+        }),
+        query: z.object({
+          tag: z.array(z.string()),
+        }),
+        params: z.object({
+          workspaceId: z.string(),
+        }),
+      },
+      handler,
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys?tag=a&tag=b", {
+        method: "POST",
+        body: JSON.stringify({ name: "Survey API" }),
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+      {
+        params: Promise.resolve({
+          workspaceId: "ws_123",
+        }),
+      } as never
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Request-Id")).toBe("handler-request-id");
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  test("returns 400 problem response for malformed JSON input", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const wrapped = withV3ApiWrapper({
+      auth: "none",
+      schemas: {
+        body: z.object({
+          name: z.string(),
+        }),
+      },
+      handler,
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        method: "POST",
+        body: "{",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(400);
+    expect(handler).not.toHaveBeenCalled();
+    const body = await response.json();
+    expect(body.invalid_params).toEqual([
+      {
+        name: "body",
+        reason: "Malformed JSON input, please check your request body",
+      },
+    ]);
+    // The count and names, never the entries: the array is as long as the caller made it (ENG-3384).
+    expect(mockLoggerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        statusCode: 400,
+        detail: "Invalid request body",
+        invalidParamCount: 1,
+        invalidParamNames: ["body"],
+      }),
+      "V3 API request validation failed"
+    );
+    expect(mockLoggerWarn.mock.calls.at(-1)?.[0]).not.toHaveProperty("invalidParams");
+  });
+
+  test("returns 413 problem response for oversized JSON input", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const wrapped = withV3ApiWrapper({
+      auth: "none",
+      schemas: {
+        body: z.object({
+          name: z.string(),
+        }),
+      },
+      handler,
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        method: "POST",
+        body: "{}",
+        headers: {
+          "Content-Length": String(DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1),
+          "Content-Type": "application/json",
+          "x-request-id": "req-payload-too-large",
+        },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(413);
+    expect(handler).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual(
+      expect.objectContaining({
+        code: "payload_too_large",
+        detail: `Request body must not exceed ${DEFAULT_REQUEST_BODY_LIMIT_BYTES} bytes`,
+        requestId: "req-payload-too-large",
+        status: 413,
+        title: "Payload Too Large",
+      })
+    );
+  });
+
+  test("returns 400 problem response for invalid route params", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const wrapped = withV3ApiWrapper({
+      auth: "none",
+      schemas: {
+        params: z.object({
+          workspaceId: z.string().min(3),
+        }),
+      },
+      handler,
+    });
+
+    const response = await wrapped(new NextRequest("http://localhost/api/v3/surveys"), {
+      params: Promise.resolve({
+        workspaceId: "x",
+      }),
+    } as never);
+
+    expect(response.status).toBe(400);
+    expect(handler).not.toHaveBeenCalled();
+    const body = await response.json();
+    expect(body.invalid_params).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: "workspaceId" })])
+    );
+  });
+
+  test("preserves machine-readable validation metadata from Zod issues", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const wrapped = withV3ApiWrapper({
+      auth: "none",
+      schemas: {
+        body: z.unknown().superRefine((_value, ctx) => {
+          ctx.addIssue({
+            code: "custom",
+            message: "Unsupported field 'extra'",
+            path: ["extra"],
+            params: { code: "unsupported_field" },
+          });
+        }),
+      },
+      handler,
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        method: "POST",
+        body: JSON.stringify({ extra: true }),
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(400);
+    expect(handler).not.toHaveBeenCalled();
+    const body = await response.json();
+    expect(body.invalid_params).toEqual([
+      {
+        name: "extra",
+        reason: "Unsupported field 'extra'",
+        code: "unsupported_field",
+      },
+    ]);
+  });
+
+  test("returns 429 problem response when rate limited", async () => {
+    const { applyRateLimit } = await import("@/modules/core/rate-limit/helpers");
+    mockGetSession.mockResolvedValue({
+      user: { id: "user_1" },
+      expires: "2026-01-01",
+    });
+    vi.mocked(applyRateLimit).mockRejectedValueOnce(new TooManyRequestsError("Too many requests", 60));
+
+    const wrapped = withV3ApiWrapper({
+      auth: "both",
+      handler: async () => Response.json({ ok: true }),
+    });
+
+    const response = await wrapped(new NextRequest("http://localhost/api/v3/surveys"), {} as never);
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("60");
+    const body = await response.json();
+    expect(body.code).toBe("too_many_requests");
+  });
+
+  test("applies rate limiting before parsing request bodies", async () => {
+    const { applyRateLimit } = await import("@/modules/core/rate-limit/helpers");
+    mockGetSession.mockResolvedValue({
+      user: { id: "user_1" },
+      expires: "2026-01-01",
+    });
+    vi.mocked(applyRateLimit).mockRejectedValueOnce(new TooManyRequestsError("Too many requests", 60));
+
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const wrapped = withV3ApiWrapper({
+      auth: "both",
+      schemas: {
+        body: z.object({
+          name: z.string(),
+        }),
+      },
+      handler,
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        method: "POST",
+        body: "{",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(429);
+    expect(handler).not.toHaveBeenCalled();
+    const body = await response.json();
+    expect(body.code).toBe("too_many_requests");
+  });
+
+  test("returns 500 problem response when the handler throws unexpectedly", async () => {
+    mockGetSession.mockResolvedValue({
+      user: { id: "user_1" },
+      expires: "2026-01-01",
+    });
+
+    const wrapped = withV3ApiWrapper({
+      auth: "both",
+      handler: async () => {
+        throw new Error("boom");
+      },
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        headers: { "x-request-id": "req-boom" },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(500);
+    const body = await response.json();
+    expect(body.code).toBe("internal_server_error");
+    expect(body.requestId).toBe("req-boom");
+  });
+
+  /**
+   * The wrapper's catch is a backstop, not a flattener: operations map their own throws (they must — the
+   * MCP tools call them without this wrapper), so anything arriving here escaped that and gets the same
+   * treatment rather than a blanket 500. A missing resource is the case that matters, because 403-not-404
+   * is the disclosure rule the whole surface relies on.
+   */
+  test("maps a thrown ResourceNotFoundError to 403, not a blanket 500", async () => {
+    mockGetSession.mockResolvedValue({ user: { id: "user_1" }, expires: "2026-01-01" });
+
+    const wrapped = withV3ApiWrapper({
+      auth: "both",
+      handler: async () => {
+        throw new ResourceNotFoundError("Survey", "survey_secret");
+      },
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        headers: { "x-request-id": "req-missing" },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(403);
+    const body = await response.json();
+    expect(body.code).toBe("forbidden");
+    expect(body.requestId).toBe("req-missing");
+    expect(JSON.stringify(body)).not.toContain("survey_secret");
+  });
+});
+
+/**
+ * There was no error reporting under `app/api/v3` before this. The tests matter more than usual
+ * because the reporting is invisible in every response: nothing about a 500's body tells you whether
+ * it reached the log, so a regression here is silent by construction.
+ */
+describe("5xx reporting", () => {
+  const reported = () => vi.mocked(reportApiError).mock.calls.map(([c]) => c);
+
+  beforeEach(() => {
+    vi.mocked(reportApiError).mockClear();
+    mockGetSession.mockResolvedValue({ user: { id: "user_1" }, expires: "2026-01-01" });
+  });
+
+  /**
+   * The path that would otherwise be missed. A v3 operation returns its problem response rather than
+   * throwing — it must, because the MCP server calls it directly with no wrapper — so a `catch`-only
+   * hook would see almost no real failure.
+   */
+  test("reports a 500 the handler returned rather than threw", async () => {
+    const route = withV3ApiWrapper({
+      auth: "session",
+      handler: async () => Response.json({ title: "Internal Server Error" }, { status: 500 }),
+    });
+
+    const response = await route(new NextRequest("http://localhost/api/v3/things"), {} as never);
+
+    expect(reported()).toHaveLength(1);
+    expect(reported()[0]).toMatchObject({ status: 500, apiVersion: "v3" });
+    // Reporting must be a pure observation: the caller's body reaches them untouched. Without this
+    // the test passes even if the reporter consumed or replaced the response.
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({ title: "Internal Server Error" });
+  });
+
+  /** The thrown path carries the original error, which keeps the real cause in the log. */
+  test("reports a thrown error, passing the error itself", async () => {
+    const boom = new Error("kaboom");
+    const route = withV3ApiWrapper({
+      auth: "session",
+      handler: async () => {
+        throw boom;
+      },
+    });
+
+    const response = await route(new NextRequest("http://localhost/api/v3/things"), {} as never);
+
+    expect(response.status).toBe(500);
+    expect(reported()).toHaveLength(1);
+    expect(reported()[0]).toMatchObject({ status: 500, apiVersion: "v3", error: boom });
+  });
+
+  /**
+   * 503 sits in this list rather than with the 5xx above because in v3 it is not a fault: it means the
+   * capability is not enabled on this deployment, and a transient outage is a 502. Without this row a
+   * self-hoster running without Hub or AI configured raises an error report on every such request.
+   */
+  test.each([
+    ["a success", 200],
+    ["a client error", 400],
+    ["a forbidden", 403],
+    ["a not-configured 503", 503],
+  ])("stays silent on %s — the log is for 5xx only", async (_label, status) => {
+    const route = withV3ApiWrapper({
+      auth: "session",
+      handler: async () => new Response(null, { status }),
+    });
+
+    await route(new NextRequest("http://localhost/api/v3/things"), {} as never);
+
+    expect(reported()).toHaveLength(0);
+  });
+
+  /**
+   * The other half of skipping 503: a transient upstream failure is a 502 in v3, and that still has to
+   * reach the log. Without this the 503 exclusion could quietly widen to every dependency problem.
+   */
+  test("still reports a 502 — an outage is a fault, unlike a 503", async () => {
+    const route = withV3ApiWrapper({
+      auth: "session",
+      handler: async () => Response.json({ title: "Bad Gateway" }, { status: 502 }),
+    });
+
+    await route(new NextRequest("http://localhost/api/v3/things"), {} as never);
+
+    expect(reported()).toHaveLength(1);
+    expect(reported()[0]).toMatchObject({ status: 502, apiVersion: "v3" });
+  });
+
+  /** Observability must never change what the caller gets back. */
+  test("a reporter failure does not affect the response", async () => {
+    vi.mocked(reportApiError).mockImplementationOnce(() => {
+      throw new Error("reporter is down");
+    });
+    const route = withV3ApiWrapper({
+      auth: "session",
+      // Deliberately 502, not 503: a 503 never reaches the reporter now, so this would assert nothing.
+      handler: async () => Response.json({ x: 1 }, { status: 502 }),
+    });
+
+    const response = await route(new NextRequest("http://localhost/api/v3/things"), {} as never);
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toEqual({ x: 1 });
+  });
+});
+
+/**
+ * `formatZodIssues` changed every v3 400 — an unsupported key is now named instead of the body — and
+ * nothing exercised it. The one "Unsupported field" case in this file builds a `custom` issue through
+ * `superRefine`, which never reaches the expansion, so reverting the function to Zod's base `map`
+ * kept the suite green.
+ *
+ * Driven through a real `.strict()` parse rather than a hand-built issue: the expansion reads
+ * `issue.keys`, which Zod populates and a fixture would only assert the shape of.
+ */
+describe("formatZodIssues — the unknown-key expansion", () => {
+  const strictBody = z.object({ kept: z.string() }).strict();
+
+  const issuesFor = (value: Record<string, unknown>) => {
+    const parsed = strictBody.safeParse(value);
+    if (parsed.success) throw new Error("expected the strict parse to reject");
+    return formatZodIssues(parsed.error, "body");
+  };
+
+  test("names each unknown key instead of the body", () => {
+    const params = issuesFor({ kept: "x", extra: 1, alsoExtra: 2 });
+
+    expect(params).toEqual([
+      { name: "extra", reason: "Unsupported field 'extra'", code: "unsupported_field" },
+      { name: "alsoExtra", reason: "Unsupported field 'alsoExtra'", code: "unsupported_field" },
+    ]);
+  });
+
+  test("stops at 20 keys and says how many it did not list", () => {
+    const value: Record<string, unknown> = { kept: "x" };
+    for (let i = 0; i < 25; i += 1) value[`extra${i}`] = i;
+
+    const params = issuesFor(value);
+
+    // 20 named, plus one summary — the list is caller-controlled and reaches both the body and the log.
+    expect(params).toHaveLength(21);
+    expect(params.at(-1)).toEqual({
+      name: "body",
+      reason: "5 further unsupported fields were not listed",
+      code: "unsupported_field",
+    });
+  });
+
+  test("a nested object's keys are reported under their path", () => {
+    const nested = z.object({ meta: z.object({ kept: z.string() }).strict() }).strict();
+    const parsed = nested.safeParse({ meta: { kept: "x", extra: 1 } });
+    if (parsed.success) throw new Error("expected the strict parse to reject");
+
+    expect(formatZodIssues(parsed.error, "body")).toEqual([
+      { name: "meta.extra", reason: "Unsupported field 'extra'", code: "unsupported_field" },
+    ]);
+  });
+
+  test("an issue carrying no key list still produces a param", () => {
+    // The fallback exists so an empty list cannot leave a 400 with no `invalid_params` at all.
+    const params = formatZodIssues(
+      { issues: [{ code: "unrecognized_keys", path: [], message: "Unrecognized key" }] } as never,
+      "body"
+    );
+
+    expect(params).toEqual([{ name: "body", reason: "Unrecognized key", code: "unsupported_field" }]);
+  });
+
+  test("lists at most 50 problems and counts the rest (ENG-3384)", () => {
+    // One Zod issue per bad element: the shape a junk array produces once it is under the array cap.
+    const parsed = z
+      .array(z.number())
+      .safeParse(Array.from({ length: V3_INVALID_PARAMS_MAX + 10 }, () => "x"));
+    if (parsed.success) throw new Error("expected the parse to reject");
+
+    const params = formatZodIssues(parsed.error, "body");
+
+    // The limit counts the summary: 49 problems listed, the 50th entry counts the other eleven.
+    expect(params).toHaveLength(V3_INVALID_PARAMS_MAX);
+    expect(params[0]).toMatchObject({ name: "0" });
+    expect(params.at(-1)).toEqual({
+      name: "body",
+      reason: "11 further problems with this request were not reported; fix the ones above and retry",
+    });
+  });
+});
+
+describe("request array budget (ENG-3384)", () => {
+  test("refuses an oversized array with one invalid_param before the body schema runs", async () => {
+    let schemaRan = false;
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+    const wrapped = withV3ApiWrapper({
+      auth: "none",
+      schemas: {
+        body: z.unknown().superRefine(() => {
+          schemaRan = true;
+        }),
+      },
+      handler,
+    });
+
+    const response = await wrapped(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-request-id": "req-budget" },
+        body: JSON.stringify({
+          blocks: [{ elements: Array.from({ length: V3_REQUEST_ARRAY_MAX_ITEMS + 1 }, () => 0) }],
+        }),
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(400);
+    expect(handler).not.toHaveBeenCalled();
+    expect(schemaRan).toBe(false);
+    await expect(response.json()).resolves.toMatchObject({
+      requestId: "req-budget",
+      invalid_params: [
+        {
+          name: "blocks.0.elements",
+          reason: `Too big: expected array to have <=${V3_REQUEST_ARRAY_MAX_ITEMS} items`,
+        },
+      ],
+    });
+    expect(mockLoggerWarn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        statusCode: 400,
+        invalidParamCount: 1,
+        invalidParamNames: ["blocks.0.elements"],
+      }),
+      "V3 API request validation failed"
+    );
+  });
+
+  test("refuses a body nested past the cap before JSON.parse builds it", async () => {
+    // Parsing is what a hostile body costs (15.5 MiB of `[[[…]]]` is ~470 MB parsed), so the budget
+    // has to hold on the raw text.
+    const deep = `{"a":${"[".repeat(V3_REQUEST_MAX_DEPTH)}0${"]".repeat(V3_REQUEST_MAX_DEPTH)}}`;
+    const parse = vi.spyOn(JSON, "parse");
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await withV3ApiWrapper({ auth: "none", schemas: { body: z.unknown() }, handler })(
+      new NextRequest("http://localhost/api/v3/surveys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: deep,
+      }),
+      {} as never
+    );
+    const parsedTheBody = parse.mock.calls.some(([text]) => text === deep);
+    parse.mockRestore();
+
+    expect(response.status).toBe(400);
+    expect(parsedTheBody).toBe(false);
+    expect(handler).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      invalid_params: [
+        {
+          name: "a.0.0.0.0.0.0.0.0.0.…",
+          reason: `Too deep: expected the request to nest <=${V3_REQUEST_MAX_DEPTH} levels`,
+        },
+      ],
+    });
+  });
+
+  // The workflows routes declare no body schema and hand `req` to a handler that reads it itself, so
+  // the wrapper checks a clone and leaves the handler's stream intact.
+  describe("a route without a body schema", () => {
+    test("still refuses an oversized array before the handler reads the body", async () => {
+      const handler = vi.fn(async () => Response.json({ ok: true }));
+
+      const response = await withV3ApiWrapper({ auth: "none", handler })(
+        new NextRequest("http://localhost/api/v3/workflows", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            definition: { nodes: Array.from({ length: V3_REQUEST_ARRAY_MAX_ITEMS + 1 }, () => 0) },
+          }),
+        }),
+        {} as never
+      );
+
+      expect(response.status).toBe(400);
+      expect(handler).not.toHaveBeenCalled();
+      await expect(response.json()).resolves.toMatchObject({
+        invalid_params: [expect.objectContaining({ name: "definition.nodes" })],
+      });
+    });
+
+    test("answers 413 to a body without content-length that exceeds the limit", async () => {
+      const handler = vi.fn(async () => Response.json({ ok: true }));
+      const oversized = new TextEncoder().encode(`{"a":"${"x".repeat(DEFAULT_REQUEST_BODY_LIMIT_BYTES)}"}`);
+
+      const response = await withV3ApiWrapper({ auth: "none", handler })(
+        new NextRequest("http://localhost/api/v3/workflows", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(oversized);
+              controller.close();
+            },
+          }),
+          duplex: "half",
+        } as ConstructorParameters<typeof NextRequest>[1]),
+        {} as never
+      );
+
+      expect(response.status).toBe(413);
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    test("hands an acceptable body to the handler unread", async () => {
+      const handler = vi.fn(async ({ req }: { req: NextRequest }) => Response.json(await req.json()));
+
+      const response = await withV3ApiWrapper({ auth: "none", handler })(
+        new NextRequest("http://localhost/api/v3/workflows", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: "Nudge", definition: { nodes: [{ id: "n1" }] } }),
+        }),
+        {} as never
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        name: "Nudge",
+        definition: { nodes: [{ id: "n1" }] },
+      });
+    });
+
+    test("leaves a body that is not JSON to the handler", async () => {
+      const handler = vi.fn(async ({ req }: { req: NextRequest }) => new Response(await req.text()));
+
+      const response = await withV3ApiWrapper({ auth: "none", handler })(
+        new NextRequest("http://localhost/api/v3/workflows", { method: "POST", body: "not json" }),
+        {} as never
+      );
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      await expect(response.text()).resolves.toBe("not json");
+    });
+  });
+});
+
+describe("per-route body limit (bodyLimitBytes)", () => {
+  const ROUTE_LIMIT = DEFAULT_REQUEST_BODY_LIMIT_BYTES * 2;
+
+  /** A JSON body of exactly `bytes` bytes, as `{"a":"xxx…"}`. */
+  const jsonBodyOfSize = (bytes: number) => `{"a":"${"x".repeat(bytes - 8)}"}`;
+
+  /** No Content-Length: the limit has to be enforced while reading, not from the header. */
+  const streamedPost = (body: string) =>
+    new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(body));
+          controller.close();
+        },
+      }),
+      duplex: "half",
+    } as ConstructorParameters<typeof NextRequest>[1]);
+
+  const declaredBodyRoute = (handler: Parameters<typeof withV3ApiWrapper>[0]["handler"], limit?: number) =>
+    withV3ApiWrapper({
+      auth: "none",
+      schemas: { body: z.object({ a: z.string() }) },
+      ...(limit === undefined ? {} : { bodyLimitBytes: limit }),
+      handler,
+    });
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  test("a route without bodyLimitBytes still caps a streamed body at the 2 MB default", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await declaredBodyRoute(handler)(
+      streamedPost(jsonBodyOfSize(DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1)),
+      {} as never
+    );
+
+    expect(response.status).toBe(413);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  test("accepts a body above the default when the route allows it", async () => {
+    const handler = vi.fn(async ({ parsedInput }) => Response.json({ length: parsedInput.body.a.length }));
+    const body = jsonBodyOfSize(DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1024);
+
+    const response = await declaredBodyRoute(handler, ROUTE_LIMIT)(streamedPost(body), {} as never);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ length: body.length - 8 });
+  });
+
+  test("refuses a streamed body one byte over the route's limit, naming that limit", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await declaredBodyRoute(handler, ROUTE_LIMIT)(
+      streamedPost(jsonBodyOfSize(ROUTE_LIMIT + 1)),
+      {} as never
+    );
+
+    expect(response.status).toBe(413);
+    expect(handler).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      code: "payload_too_large",
+      detail: `Request body must not exceed ${ROUTE_LIMIT} bytes`,
+    });
+  });
+
+  test("refuses from the Content-Length header before reading the body", async () => {
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await declaredBodyRoute(handler, ROUTE_LIMIT)(
+      new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+        method: "POST",
+        body: "{}",
+        headers: { "Content-Type": "application/json", "Content-Length": String(ROUTE_LIMIT + 1) },
+      }),
+      {} as never
+    );
+
+    expect(response.status).toBe(413);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  test("applies to a route without a body schema too", async () => {
+    const handler = vi.fn(async ({ req }: { req: NextRequest }) =>
+      Response.json({ size: (await req.text()).length })
+    );
+    const body = jsonBodyOfSize(DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1024);
+    const route = withV3ApiWrapper({ auth: "none", bodyLimitBytes: ROUTE_LIMIT, handler });
+
+    const accepted = await route(streamedPost(body), {} as never);
+    const refused = await route(streamedPost(jsonBodyOfSize(ROUTE_LIMIT + 1)), {} as never);
+
+    expect(accepted.status).toBe(200);
+    await expect(accepted.json()).resolves.toEqual({ size: body.length });
+    expect(refused.status).toBe(413);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "refuses to build a route with bodyLimitBytes %s",
+    (bodyLimitBytes) => {
+      expect(() =>
+        withV3ApiWrapper({ auth: "none", bodyLimitBytes, handler: async () => new Response(null) })
+      ).toThrow(/bodyLimitBytes must be a positive integer/);
+    }
+  );
+});
+
+describe("per-route concurrency limit", () => {
+  const sessionUser = { user: { id: "user_1" }, expires: "2099-01-01" };
+
+  const postJson = (body: string) =>
+    new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+
+  const limitedRoute = (
+    limiter: ConcurrencyLimiter,
+    handler: Parameters<typeof withV3ApiWrapper>[0]["handler"]
+  ) =>
+    withV3ApiWrapper({
+      auth: "session",
+      schemas: { body: z.object({ a: z.string() }) },
+      concurrency: { limiter, retryAfterSeconds: 7 },
+      handler,
+    });
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockGetSession.mockResolvedValue(sessionUser);
+  });
+
+  test("answers 503 capacity_reached with Retry-After when every slot is taken, before reading the body", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const held = limiter.tryAcquire("someone_else");
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    // Not JSON: a 400 here would mean the body was read before admission.
+    const response = await limitedRoute(limiter, handler)(postJson("not json"), {} as never);
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("7");
+    expect(handler).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({ code: "capacity_reached", status: 503 });
+    if (held.ok) held.release();
+  });
+
+  test("answers 429 with Retry-After when the caller already holds its share, while others still get in", async () => {
+    const limiter = new ConcurrencyLimiter(3, { maxPerKey: 1 });
+    const mine = limiter.tryAcquire("user_1");
+    const handler = vi.fn(async () => Response.json({ ok: true }));
+
+    const response = await limitedRoute(limiter, handler)(postJson('{"a":"x"}'), {} as never);
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("7");
+    // Its own code, not the rate limit's: the caller waits for its own request rather than slowing down.
+    await expect(response.json()).resolves.toMatchObject({ code: "concurrency_limit_reached" });
+    expect(handler).not.toHaveBeenCalled();
+    expect(limiter.tryAcquire("user_2").ok).toBe(true);
+    if (mine.ok) mine.release();
+  });
+
+  test("does not take a slot for an unauthenticated or rate-limited request", async () => {
+    const { applyRateLimit } = await import("@/modules/core/rate-limit/helpers");
+    const limiter = new ConcurrencyLimiter(1);
+    const route = limitedRoute(limiter, async () => Response.json({ ok: true }));
+
+    mockGetSession.mockResolvedValueOnce(null);
+    expect((await route(postJson('{"a":"x"}'), {} as never)).status).toBe(401);
+
+    vi.mocked(applyRateLimit).mockRejectedValueOnce(new TooManyRequestsError("slow down", 60));
+    expect((await route(postJson('{"a":"x"}'), {} as never)).status).toBe(429);
+
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("refuses a rate-limited caller for its rate limit even when every slot is taken", async () => {
+    // The rate limit answers first: a caller over it hears 429 and when to retry, not that the server
+    // is busy, and never takes a slot it was not going to use.
+    const { applyRateLimit } = await import("@/modules/core/rate-limit/helpers");
+    const limiter = new ConcurrencyLimiter(1);
+    const held = limiter.tryAcquire("someone_else");
+    vi.mocked(applyRateLimit).mockRejectedValueOnce(new TooManyRequestsError("slow down", 60));
+
+    const response = await limitedRoute(limiter, async () => Response.json({ ok: true }))(
+      postJson('{"a":"x"}'),
+      {} as never
+    );
+
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toMatchObject({ code: "too_many_requests" });
+    if (held.ok) held.release();
+  });
+
+  test("frees the slot after a plain response, and after a request that fails validation", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const route = limitedRoute(limiter, async () => Response.json({ ok: true }));
+
+    const ok = await route(postJson('{"a":"x"}'), {} as never);
+    await ok.text();
+    const invalid = await route(postJson('{"b":1}'), {} as never);
+
+    expect(ok.status).toBe(200);
+    expect(invalid.status).toBe(400);
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("frees the slot when the handler throws", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const route = limitedRoute(limiter, async () => {
+      throw new Error("boom");
+    });
+
+    const response = await route(postJson('{"a":"x"}'), {} as never);
+
+    expect(response.status).toBe(500);
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("keeps the slot while a streamed body is still being sent, and frees it at the end", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    let finish: (() => void) | undefined;
+    const route = limitedRoute(
+      limiter,
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"type":"start"}\n'));
+              finish = () => controller.close();
+            },
+          })
+        )
+    );
+
+    const streaming = await route(postJson('{"a":"x"}'), {} as never);
+    const whileStreaming = await route(postJson('{"a":"x"}'), {} as never);
+    const read = streaming.text();
+    finish?.();
+    await read;
+
+    expect(whileStreaming.status).toBe(503);
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("frees the slot when the client cancels the stream", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const route = limitedRoute(
+      limiter,
+      async () => new Response(new ReadableStream<Uint8Array>({ pull() {} }))
+    );
+
+    const streaming = await route(postJson('{"a":"x"}'), {} as never);
+    expect(limiter.inFlight).toBe(1);
+    await streaming.body?.cancel();
+
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("frees the slot when the client disconnects, even though nobody reads or cancels the body", async () => {
+    // Next returns early from piping a body to a response the client already closed: it neither reads
+    // nor cancels it. The request signal is the only thing that fires.
+    const limiter = new ConcurrencyLimiter(1);
+    const client = new AbortController();
+    const route = limitedRoute(
+      limiter,
+      async () => new Response(new ReadableStream<Uint8Array>({ pull() {} }))
+    );
+
+    const response = await route(
+      new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: '{"a":"x"}',
+        signal: client.signal,
+      }),
+      {} as never
+    );
+    expect(response.status).toBe(200);
+    expect(limiter.inFlight).toBe(1);
+
+    client.abort();
+
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("a client that hangs up early keeps its slot until the handler is done with the request", async () => {
+    // Freeing the slot on the abort itself would let a client open a request, hang up straight away and
+    // open the next, each leaving a body parse and handler running past the limit.
+    const limiter = new ConcurrencyLimiter(1);
+    const client = new AbortController();
+    let finishHandler: (() => void) | undefined;
+    let handlerStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      handlerStarted = resolve;
+    });
+    const route = limitedRoute(limiter, async () => {
+      handlerStarted?.();
+      await new Promise<void>((resolve) => {
+        finishHandler = resolve;
+      });
+      return new Response(new ReadableStream<Uint8Array>({ pull() {} }));
+    });
+
+    const pending = route(
+      new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: '{"a":"x"}',
+        signal: client.signal,
+      }),
+      {} as never
+    );
+    await started;
+    client.abort();
+
+    expect(limiter.inFlight).toBe(1);
+    expect((await route(postJson('{"a":"x"}'), {} as never)).status).toBe(503);
+
+    finishHandler?.();
+    await pending;
+
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("frees the slot when the response cannot be handed to its body", async () => {
+    // A locked body cannot be wrapped. Rare, but the slot would otherwise stay taken until a restart.
+    const limiter = new ConcurrencyLimiter(1);
+    const route = limitedRoute(limiter, async () => {
+      const locked = new Response(new ReadableStream<Uint8Array>({ pull() {} }), {
+        headers: { "X-Request-Id": "req_locked" },
+      });
+      locked.body?.getReader();
+      return locked;
+    });
+
+    const response = await route(postJson('{"a":"x"}'), {} as never);
+
+    expect(response.status).toBe(500);
+    expect(limiter.inFlight).toBe(0);
+  });
+
+  test("a disconnect after the body settled releases nothing twice", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const client = new AbortController();
+    const route = limitedRoute(limiter, async () => Response.json({ ok: true }));
+
+    const response = await route(
+      new NextRequest("http://localhost/api/internal/surveys/import/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: '{"a":"x"}',
+        signal: client.signal,
+      }),
+      {} as never
+    );
+    await response.text();
+    const other = limiter.tryAcquire("someone_else");
+    client.abort();
+
+    expect(limiter.inFlight).toBe(1);
+    if (other.ok) other.release();
+  });
+
+  test.each([0, -3, 1.5])("refuses to build a route with retryAfterSeconds %s", (retryAfterSeconds) => {
+    expect(() =>
+      withV3ApiWrapper({
+        auth: "session",
+        concurrency: { limiter: new ConcurrencyLimiter(1), retryAfterSeconds },
+        handler: async () => new Response(null),
+      })
+    ).toThrow(/retryAfterSeconds must be a positive integer/);
+  });
+});

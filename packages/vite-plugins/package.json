@@ -1,0 +1,28 @@
+{
+  "name": "@forms/vite-plugins",
+  "license": "MIT",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "homepage": "/",
+  "repository": {
+    "type": "git",
+    "url": "/"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "clean": "rimraf .turbo node_modules dist",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@forms/config-eslint": "workspace:*",
+    "@forms/config-typescript": "workspace:*",
+    "postcss": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

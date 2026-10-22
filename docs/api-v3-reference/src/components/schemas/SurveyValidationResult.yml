@@ -1,0 +1,44 @@
+type: object
+required:
+  - valid
+  - operation
+  - invalid_params
+properties:
+  valid:
+    type: boolean
+    description: Whether the submitted survey document is valid.
+  operation:
+    type: string
+    enum:
+      - create
+      - patch
+  invalid_params:
+    type: array
+    description: Repairable validation errors using document-relative paths.
+    items:
+      $ref: ./InvalidParam.yml
+  languages:
+    type: array
+    description: >-
+      Languages that a successful write would connect or create. Present only
+      when `valid=true`.
+    items:
+      $ref: ./SurveyValidationLanguage.yml
+  customCss:
+    $ref: ./CustomCssCompiled.yml
+    description: >-
+      Compiled custom CSS, when the payload carried `customCss` and `valid=true`. Never present on a
+      failed validation.
+  warnings:
+    type: array
+    maxItems: 50
+    description: Constructs the processor removed from the payload's `customCss`, when it carried one.
+    items:
+      $ref: ./CustomCssWarning.yml
+  errors:
+    type: array
+    maxItems: 50
+    description: Why the payload's `customCss` could not be processed, when it could not.
+    items:
+      $ref: ./CustomCssError.yml
+additionalProperties: false
