@@ -35,7 +35,7 @@ runs:
         ecr_region: ${{ inputs.ecr_region }}
         aws_role_arn: ${{ inputs.aws_role_arn }}
     - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-    - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+    - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
       if: inputs.registry_type == 'ghcr'
     - name: Promote verified digest without rebuilding
       env:
