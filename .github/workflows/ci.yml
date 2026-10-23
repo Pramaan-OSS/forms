@@ -1,0 +1,111 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  # Local placeholders; only the test job starts disposable services.
+  DATABASE_URL: postgresql://template:template@127.0.0.1:5432/template
+  REDIS_URL: redis://127.0.0.1:56379
+  BETTER_AUTH_SECRET: local-template-checks-placeholder-secret
+  ENCRYPTION_KEY: "00000000000000000000000000000000"
+  PRAMAAN_API_KEY: ""
+  PRAMAAN_FAKE: "1"
+  DO_NOT_TRACK: "1"
+  NEXT_TELEMETRY_DISABLED: "1"
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck --concurrency=2
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ONLINE_UPGRADE_TEST_DATABASE_URL: postgresql://template:template@127.0.0.1:55479/template
+      ONLINE_UPGRADE_TEST_REDIS_URL: redis://127.0.0.1:56379
+    services:
+      postgres:
+        image: postgres:17.11-alpine
+        env:
+          POSTGRES_USER: template
+          POSTGRES_PASSWORD: template
+          POSTGRES_DB: template
+        ports: ["55479:5432"]
+        options: >-
+          --health-cmd="pg_isready -U template -d template"
+          --health-interval=5s --health-timeout=5s --health-retries=10
+      redis:
+        image: redis:7.4.11-alpine
+        ports: ["56379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=5s --health-retries=10
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test --concurrency=2 -- --maxWorkers=2
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build --concurrency=2

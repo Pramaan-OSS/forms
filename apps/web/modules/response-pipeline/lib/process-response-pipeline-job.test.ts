@@ -33,8 +33,6 @@ const {
   mockSendFollowUpsForResponse,
   mockSendResponseFinishedEmail,
 } = vi.hoisted(() => {
-  process.env.HUB_API_URL ??= "https://hub.test";
-
   return {
     mockFilterAuthorizedUserIds: vi.fn(),
     mockIsSurveyVisibilityReady: vi.fn(),

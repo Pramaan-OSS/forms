@@ -78,13 +78,13 @@ describe("Node.js version alignment", () => {
 
   test("every setup-node step reads .nvmrc", () => {
     const actionsDir = path.join(repoRoot, ".github", "actions");
-    const files = [
-      ...listYaml(".github", "workflows"),
-      ...fs
-        .readdirSync(actionsDir, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .flatMap((entry) => listYaml(".github", "actions", entry.name)),
-    ];
+    const actionFiles = fs.existsSync(actionsDir)
+      ? fs
+          .readdirSync(actionsDir, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory())
+          .flatMap((entry) => listYaml(".github", "actions", entry.name))
+      : [];
+    const files = [...listYaml(".github", "workflows"), ...actionFiles];
     const offenders: string[] = [];
     let setupNodeSteps = 0;
 

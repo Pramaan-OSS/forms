@@ -1,5 +1,7 @@
 /** Only explicitly supplied HTTPS pages may be embedded or linked. */
 export function parseBookingPageUrl(value: string | undefined): string | undefined {
+  // Reject control characters before URL parsing can normalize them away.
+  // eslint-disable-next-line no-control-regex
   if (!value || value.length > 2048 || /[\s\\\u0000-\u001f\u007f]/.test(value)) return undefined;
   try {
     const url = new URL(value);

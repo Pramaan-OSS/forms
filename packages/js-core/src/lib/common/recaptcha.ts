@@ -95,7 +95,7 @@ export const executeRecaptcha = async (
         }
       });
     });
-  } catch (error) {
+  } catch {
     logger.debug("Challenge verification failed");
     return null;
   }

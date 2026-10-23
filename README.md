@@ -1,3 +1,5 @@
+[![CI](https://github.com/Pramaan-OSS/forms/actions/workflows/ci.yml/badge.svg)](https://github.com/Pramaan-OSS/forms/actions/workflows/ci.yml)
+
 # Forms
 
 Create surveys, collect responses and connect your own accounts through Pramaan.
